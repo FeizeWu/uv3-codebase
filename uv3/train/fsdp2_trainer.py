@@ -437,6 +437,10 @@ def train(cfg: ExperimentConfig):
     # 长时测速可通过环境变量丢弃初始化/缓存预热阶段，之后重新计时。
     # 只重置统计，不改变训练状态；用于整机独占的真实全管线吞吐测量。
     bench_warmup = int(os.environ.get("UV3_BENCH_WARMUP", "0"))
+    # Diagnostic-only: scalarizing the returned DTensor norm introduces a GPU
+    # synchronization, so keep this completely out of the production path.
+    audit_grad_norm = os.environ.get("UV3_AUDIT_GRAD_NORM") == "1"
+    grad_norm_samples: list[float] = []
     measured_steps = 0
     bucket_counts = {}
     for o in optimizers.values():
@@ -514,10 +518,27 @@ def train(cfg: ExperimentConfig):
         (loss / accum).backward()                                     # backward
         timer.mark("backward")
         if (step + 1) % accum == 0:
-            # clip mmdit (FSDP2 DTensor) and projector (regular) SEPARATELY (mixed types break foreach)
-            torch.nn.utils.clip_grad_norm_(mmdit.parameters(), cfg.train.grad_clip)
-            if projector is not None:
-                torch.nn.utils.clip_grad_norm_(projector.parameters(), cfg.train.grad_clip)
+            clip_warmup = max(0, cfg.train.grad_clip_warmup_steps)
+            clip_interval = max(0, cfg.train.grad_clip_interval)
+            after_warmup = step - clip_warmup
+            should_clip = cfg.train.grad_clip > 0 and (
+                step < clip_warmup
+                or (clip_interval > 0 and after_warmup % clip_interval == 0)
+            )
+            if should_clip:
+                # Clip mmdit (FSDP2 DTensor) and projector (regular) SEPARATELY
+                # because mixing DTensor and regular tensors breaks foreach.
+                mmdit_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    mmdit.parameters(), cfg.train.grad_clip
+                )
+                if audit_grad_norm:
+                    # Execute on every rank: DTensor scalar materialization may
+                    # participate in collectives even though only rank 0 records it.
+                    grad_norm_value = float(mmdit_grad_norm.detach().item())
+                    if rank == 0:
+                        grad_norm_samples.append(grad_norm_value)
+                if projector is not None:
+                    torch.nn.utils.clip_grad_norm_(projector.parameters(), cfg.train.grad_clip)
             for o in optimizers.values():
                 o.step()                                             # optimizer
             for o in optimizers.values():
@@ -555,17 +576,34 @@ def train(cfg: ExperimentConfig):
             mem_pct = 100.0 * torch.cuda.max_memory_reserved() / torch.cuda.get_device_properties(dev).total_memory
             timing_str = " ".join(f"{k}={v:.3f}s" for k, v in ts.items()) if ts else ""
             bucket_str = f" buckets={dict(sorted(bucket_counts.items()))}" if text_buckets else ""
-            print(f"[train] step {step:5d} loss={loss.item():.4f} {spd:.2f}it/s mem={mem_gib:.1f}GiB({mem_pct:.1f}%){bucket_str} [{timing_str}]", flush=True)
+            grad_norm_stats = None
+            grad_norm_str = ""
+            if audit_grad_norm and grad_norm_samples:
+                grad_norm_stats = {
+                    "min": min(grad_norm_samples),
+                    "mean": sum(grad_norm_samples) / len(grad_norm_samples),
+                    "max": max(grad_norm_samples),
+                    "clip_count": sum(x > cfg.train.grad_clip for x in grad_norm_samples),
+                    "count": len(grad_norm_samples),
+                }
+                grad_norm_str = (
+                    f" grad_norm={grad_norm_stats['mean']:.4f}"
+                    f"/{grad_norm_stats['max']:.4f}"
+                    f" clipped={grad_norm_stats['clip_count']}/{grad_norm_stats['count']}"
+                )
+            print(f"[train] step {step:5d} loss={loss.item():.4f} {spd:.2f}it/s mem={mem_gib:.1f}GiB({mem_pct:.1f}%){bucket_str}{grad_norm_str} [{timing_str}]", flush=True)
             # JSONL metrics: timing_unit 自文档,说明 timing 是窗口和而非每步
             import json as _json
             with open(os.path.join(out_dir, "metrics.jsonl"), "a") as _jf:
                 _json.dump({"step": step, "loss": loss.item(), "spd": spd,
                             "max_memory_reserved_gib": mem_gib, "max_memory_reserved_pct": mem_pct,
                             "timing": ts, "timing_unit": f"sum_over_{log_every}_steps",
-                            "text_bucket_counts": dict(sorted(bucket_counts.items()))}, _jf)
+                            "text_bucket_counts": dict(sorted(bucket_counts.items())),
+                            "grad_norm": grad_norm_stats}, _jf)
                 _jf.write("\n")
             timer.reset()
             bucket_counts = {}
+            grad_norm_samples = []
         if cfg.train.ckpt_every < max_steps and step > 0 and step % cfg.train.ckpt_every == 0:
             opt_model._step = step
             save_ckpt(opt_model, optimizers, ckpt_path, rng=g,

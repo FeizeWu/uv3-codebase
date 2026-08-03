@@ -114,7 +114,7 @@ class TrainConfig:
     compile_text_encoder: bool = True       # compile frozen Qwen language backbone too
     compile_vae: bool = False               # compile fixed-shape frozen VAE encoder
     compile_dynamic: bool = False           # fixed 1024 text + 256 image tokens
-    compile_mode: str = "default"           # default | reduce-overhead | max-autotune
+    compile_mode: str = "default"           # default | reduce-overhead | max-autotune[-no-cudagraphs]
     # None inherits compile_mode for backward compatibility. Set explicitly to
     # benchmark MMDiT compiler modes without changing the frozen Qwen graphs.
     text_encoder_compile_mode: str | None = None
@@ -137,6 +137,10 @@ class TrainConfig:
     warmup_steps: int = 0
     lr_schedule: str = "constant"           # constant | cosine
     grad_clip: float = 1.0
+    # Clip every step by default. With a positive warmup and interval=0,
+    # clipping runs only during warmup; interval=N checks every N steps after it.
+    grad_clip_warmup_steps: int = 0
+    grad_clip_interval: int = 1
     ckpt_every: int = 2000
     output_dir: str = "/mnt/oss/users/wfz/uv3-codebase-runs"
     run_name: str = "run"
