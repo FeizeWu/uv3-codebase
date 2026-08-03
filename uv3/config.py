@@ -121,6 +121,10 @@ class TrainConfig:
     # chosen independently by another rank.
     text_length_buckets: tuple[int, ...] = ()
     text_length_bucket_weights: tuple[int, ...] = ()
+    # Keep each Qwen bucket length through MMDiT instead of padding every text
+    # embedding back to qwen_vl.max_length. This creates one static MMDiT graph
+    # per configured bucket and removes work on masked text padding.
+    pad_text_to_max_length: bool = True
     flex_attention: bool = True
     block_size: int = 128
     batch_size_per_gpu: int = 16

@@ -42,6 +42,7 @@ def _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank):
     if not cfg.train.compile:
         return
     text_buckets = tuple(int(x) for x in getattr(cfg.train, "text_length_buckets", ()))
+    pad_text_to_max = bool(getattr(cfg.train, "pad_text_to_max_length", True))
     recompile_limit = "default"
     if text_buckets:
         # Qwen's hybrid linear/full-attention stack creates more than one guarded
@@ -77,12 +78,13 @@ def _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank):
               f"text_encoder={bool(getattr(cfg.train, 'compile_text_encoder', True))} "
               f"vae={compile_vae} "
               f"vae_mode={str(getattr(cfg.train, 'vae_compile_mode', 'default')) if compile_vae else 'off'} "
+              f"mmdit_text_buckets={bool(text_buckets) and not pad_text_to_max} "
               f"dynamic=False mode={compile_kwargs['mode']} "
               f"recompile_limit={recompile_limit}", flush=True)
 
 
 def _attention_mask(mmdit, text_valid, n_img, block_size, device):
-    """Build the static [1024 text, 256 image] Flex or SDPA padding mask."""
+    """Build a per-bucket static [text, image] Flex or SDPA padding mask."""
     bs, n_txt = text_valid.shape
     image_valid = torch.ones(bs, n_img, device=device, dtype=torch.bool)
     valid = torch.cat([text_valid.to(device=device, dtype=torch.bool), image_valid], dim=1)
@@ -387,6 +389,7 @@ def train(cfg: ExperimentConfig):
         )
         ds.set_epoch(resumed_epoch)
     text_buckets = tuple(int(x) for x in getattr(cfg.train, "text_length_buckets", ()))
+    pad_text_to_max = bool(getattr(cfg.train, "pad_text_to_max_length", True))
     if text_buckets:
         text_bucket_weights = tuple(
             int(x) for x in getattr(cfg.train, "text_length_bucket_weights", ())
@@ -402,7 +405,8 @@ def train(cfg: ExperimentConfig):
         if rank == 0:
             print(
                 f"[train] static Qwen length buckets={text_buckets} "
-                f"weights={text_bucket_weights}",
+                f"weights={text_bucket_weights} "
+                f"mmdit_text_buckets={not pad_text_to_max}",
                 flush=True,
             )
     else:
@@ -454,15 +458,16 @@ def train(cfg: ExperimentConfig):
             else:
                 ids, mask = qwen.tokenize(batch["text"], dev, max_length=bucket_length)
             text = qwen.encode_text(ids, mask)                  # qwen
-            if bucket_length < cfg.model.qwen_vl.max_length:
+            if pad_text_to_max and bucket_length < cfg.model.qwen_vl.max_length:
                 pad_length = cfg.model.qwen_vl.max_length - bucket_length
                 text = F.pad(text, (0, 0, 0, pad_length))
                 mask = F.pad(mask, (0, pad_length), value=0)
             n_img = (latents.shape[-1] // 2) * (latents.shape[-2] // 2)
             expected_img = (cfg.data.image_size // 16) ** 2
-            if text.shape[1] != cfg.model.qwen_vl.max_length:
+            expected_text = cfg.model.qwen_vl.max_length if pad_text_to_max else bucket_length
+            if text.shape[1] != expected_text:
                 raise RuntimeError(
-                    f"static compile expects {cfg.model.qwen_vl.max_length} text tokens, "
+                    f"static compile expects {expected_text} text tokens, "
                     f"got {text.shape[1]}"
                 )
             if n_img != expected_img:

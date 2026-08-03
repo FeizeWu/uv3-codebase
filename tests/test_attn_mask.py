@@ -89,9 +89,13 @@ def test_padded_batch_vs_truncated():
     diff_1 = (pred_padded[1] - pred_1[0]).abs().max().item()
     print(f"  sample 0 (padded vs truncated): diff={diff_0:.2e}")
     print(f"  sample 1 (no pad, identical): diff={diff_1:.2e}")
-    assert diff_1 < 1e-5, f"sample 1 (no pad) should be identical: diff={diff_1}"
-    # sample 0 with pad should be close to truncated (pad tokens masked out)
-    assert diff_0 < 0.1, f"padded sample 0 should be close to truncated: diff={diff_0}"
+    # CUDA may select a different GEMM kernel for batch=2 and batch=1, so even
+    # the unpadded control is not bit-identical. Both paths should nevertheless
+    # agree within normal float32/TF32 kernel-ordering error.
+    assert diff_1 < 2e-3, f"sample 1 (no pad) should be numerically equal: diff={diff_1}"
+    # Tighten the old 0.1 tolerance: masked padding and a truly shorter text
+    # sequence must be equivalent at the same numerical tolerance.
+    assert diff_0 < 2e-3, f"padded sample 0 should match truncated: diff={diff_0}"
 
 
 if __name__ == "__main__":

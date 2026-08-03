@@ -251,7 +251,7 @@ class MMDiT(nn.Module):
                   f"img_ids={tuple(_positions(b, ph, pw, noisy.device).shape)} "
                   f"txt_ids={tuple(_text_positions(b, n_txt, noisy.device).shape)} "
                   f"mdtype={mdtype}", flush=True)
-        if self._flex:
+        if self._flex and text_attn_mask is None:
             from .flex_mmdit import set_block_mask
             from ..train.flex_attn import build_document_block_mask
             # bidirectional document mask: each batch element attends its own [txt+img] (no cross-sample)
