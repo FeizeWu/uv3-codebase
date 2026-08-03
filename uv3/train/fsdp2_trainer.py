@@ -55,15 +55,20 @@ def _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank):
             16 * len(text_buckets),
         )
         recompile_limit = _dynamo.config.recompile_limit
+    mmdit_compile_mode = str(getattr(cfg.train, "compile_mode", "default"))
+    configured_text_mode = getattr(cfg.train, "text_encoder_compile_mode", None)
+    text_compile_mode = (
+        mmdit_compile_mode if configured_text_mode is None else str(configured_text_mode)
+    )
     compile_kwargs = {
         "dynamic": False,
-        "mode": str(getattr(cfg.train, "compile_mode", "default")),
+        "mode": mmdit_compile_mode,
     }
     mmdit.compile(**compile_kwargs)
     if teacher is not None:
         teacher.compile(**compile_kwargs)
     if bool(getattr(cfg.train, "compile_text_encoder", True)):
-        qwen.language_model.compile(**compile_kwargs)
+        qwen.language_model.compile(dynamic=False, mode=text_compile_mode)
     compile_vae = bool(getattr(cfg.train, "compile_vae", False))
     if compile_vae:
         # AutoencoderKLFlux2.encode() is decorated and wraps its tensor result in
@@ -79,7 +84,8 @@ def _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank):
               f"vae={compile_vae} "
               f"vae_mode={str(getattr(cfg.train, 'vae_compile_mode', 'default')) if compile_vae else 'off'} "
               f"mmdit_text_buckets={bool(text_buckets) and not pad_text_to_max} "
-              f"dynamic=False mode={compile_kwargs['mode']} "
+              f"dynamic=False mmdit_mode={mmdit_compile_mode} "
+              f"text_mode={text_compile_mode} "
               f"recompile_limit={recompile_limit}", flush=True)
 
 

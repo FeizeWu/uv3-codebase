@@ -115,6 +115,9 @@ class TrainConfig:
     compile_vae: bool = False               # compile fixed-shape frozen VAE encoder
     compile_dynamic: bool = False           # fixed 1024 text + 256 image tokens
     compile_mode: str = "default"           # default | reduce-overhead | max-autotune
+    # None inherits compile_mode for backward compatibility. Set explicitly to
+    # benchmark MMDiT compiler modes without changing the frozen Qwen graphs.
+    text_encoder_compile_mode: str | None = None
     vae_compile_mode: str = "default"
     # Optional static Qwen sequence-length buckets.  Every rank follows the same
     # weighted schedule so distributed training never waits on a longer bucket
