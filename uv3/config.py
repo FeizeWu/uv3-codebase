@@ -112,6 +112,10 @@ class TrainConfig:
     reshard_after_forward: bool = True
     compile: bool = True
     compile_text_encoder: bool = True       # compile frozen Qwen language backbone too
+    text_encoder_fp8: bool = False          # torchao tensorwise FP8 dynamic-act/FP8-weight
+    text_encoder_fp8_scope: str = "all"     # all | mlp | mlp_middle
+    text_encoder_fp8_mlp_start: int = 4      # inclusive for mlp_middle
+    text_encoder_fp8_mlp_end: int = 28       # exclusive for mlp_middle
     compile_vae: bool = False               # compile fixed-shape frozen VAE encoder
     compile_dynamic: bool = False           # fixed 1024 text + 256 image tokens
     compile_mode: str = "default"           # default | reduce-overhead | max-autotune[-no-cudagraphs]

@@ -273,6 +273,63 @@ def build(cfg: ExperimentConfig, dev, dtype):
     return vae, qwen, mmdit
 
 
+def _maybe_quantize_text_encoder_fp8(qwen, cfg, rank):
+    """Quantize the frozen Qwen Linear weights before torch.compile."""
+    if not bool(getattr(cfg.train, "text_encoder_fp8", False)):
+        return
+    from torchao.quantization import (
+        Float8DynamicActivationFloat8WeightConfig,
+        quantize_,
+    )
+
+    scope = str(getattr(cfg.train, "text_encoder_fp8_scope", "all"))
+    if scope not in {"all", "mlp", "mlp_middle"}:
+        raise ValueError(
+            "text_encoder_fp8_scope must be all, mlp, or mlp_middle, "
+            f"got {scope!r}"
+        )
+    filter_fn = None
+    if scope == "mlp":
+        filter_fn = lambda module, fqn: (
+            isinstance(module, nn.Linear) and ".mlp." in fqn
+        )
+    elif scope == "mlp_middle":
+        mlp_start = int(getattr(cfg.train, "text_encoder_fp8_mlp_start", 4))
+        mlp_end = int(getattr(cfg.train, "text_encoder_fp8_mlp_end", 28))
+        if not 0 <= mlp_start < mlp_end:
+            raise ValueError(
+                f"invalid Qwen FP8 MLP layer range [{mlp_start}, {mlp_end})"
+            )
+
+        def filter_fn(module, fqn):
+            parts = fqn.split(".")
+            if not isinstance(module, nn.Linear) or "mlp" not in parts:
+                return False
+            try:
+                layers_pos = parts.index("layers")
+                layer = int(parts[layers_pos + 1])
+            except (ValueError, IndexError):
+                return False
+            return mlp_start <= layer < mlp_end
+    quantize_(
+        qwen.language_model,
+        # The torchao default mutates process-global Inductor settings. That
+        # invalidates the already autotuned MMDiT cache and needlessly recompiles
+        # all five buckets; FP8 scaled-mm itself does not require those changes.
+        Float8DynamicActivationFloat8WeightConfig(set_inductor_config=False),
+        filter_fn=filter_fn,
+    )
+    # Quantization replaces BF16 parameters in-place. Release their allocator
+    # cache before the five static Qwen graphs are materialized.
+    torch.cuda.empty_cache()
+    if rank == 0:
+        print(
+            f"[train] Qwen FP8 ON: tensorwise dynamic activation + FP8 weight "
+            f"scope={scope}",
+            flush=True,
+        )
+
+
 def train(cfg: ExperimentConfig):
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if distributed:
@@ -286,6 +343,7 @@ def train(cfg: ExperimentConfig):
     torch.manual_seed(cfg.train.seed)
 
     vae, qwen, mmdit = build(cfg, dev, dtype)
+    _maybe_quantize_text_encoder_fp8(qwen, cfg, rank)
 
     # Build the EMA teacher before FSDP so student and teacher can be sharded with
     # identical module boundaries and DTensor placements.  This lets EMA update
