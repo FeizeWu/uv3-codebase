@@ -1,0 +1,54 @@
+model:
+  architecture: mmdit
+  hidden_size: 3072
+  num_layers: 4
+  num_double_layers: 4
+  num_single_layers: 16
+  num_heads: 24
+  latent_channels: 32
+  patch_size: 2
+  rope_theta: 2000.0
+  guidance_embeds: false
+  flex_attention: true
+  alpha_on: false
+  vae: {backend: diffusers, pretrained: /mnt/data/share/checkpoints/black-forest-labs/FLUX.2-dev, trainable: false}
+  qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-9B, trainable: false, max_length: 1024}
+  transformer: {backend: random, trainable: true}
+  self_flow: {enabled: false}
+data:
+  dataset: tar
+  root: /mnt/oss/uv3-pretrain-manifect/0803-test/manifect.jsonl
+  image_size: 256
+  caption_field: caption_qwen3_7_flash
+  num_workers: 4
+train:
+  fsdp2: true
+  fsdp_text_encoder: false
+  num_replicate: 1
+  reshard_after_forward: true
+  mixed_precision: bf16
+  compile: true
+  compile_text_encoder: true
+  compile_vae: false
+  compile_dynamic: false
+  compile_mode: default
+  text_length_buckets: [512, 640, 768, 896, 1024]
+  text_length_bucket_weights: [5, 4, 4, 3, 4]
+  flex_attention: true
+  block_size: 128
+  batch_size_per_gpu: 12
+  grad_accum: 1
+  max_steps: 50
+  grad_clip: 1.0
+  ckpt_every: 100000
+  output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
+  run_name: bench_real_3b_8gpu_adamw_no_sf_qwen_5buckets_token_once_ordered_default_20260804
+  log_every: 10
+  seed: 42
+  optimizer:
+    optimizer: adamw
+    adam_lr: 1.0e-4
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    adam_weight_decay: 0.0
+    adam_fused: false

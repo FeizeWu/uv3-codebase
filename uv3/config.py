@@ -1,0 +1,190 @@
+"""Experiment configuration: YAML + nested dataclasses (UniWorld-style, extended).
+
+Note: NO `from __future__ import annotations` — we need f.type to resolve to actual
+dataclass classes (not strings) for _construct/_field_dataclass is_dataclass() checks.
+Python 3.12 natively supports `str | None` / `tuple[int, ...]` annotations.
+"""
+from dataclasses import dataclass, field, fields, is_dataclass
+from typing import Any
+import yaml
+
+
+@dataclass
+class ComponentConfig:
+    """A loadable component (vae / qwen_vl / transformer)."""
+    backend: str = "transformers"          # transformers | diffusers | random | none
+    pretrained: str | None = None          # local path or modelscope id
+    subfolder: str | None = None
+    trainable: bool = False
+    frozen: bool = False                  # explicit freeze (no grad)
+    # 文本编码器截断上限:仅 qwen_vl 消费(vae/transformer 忽略)。
+    # 必须是 dataclass 字段才能被 _construct 读入——否则 YAML 里写 max_length 会被静默丢弃,
+    # trainer 就被迫硬编码(历史 bug:max_length=64 覆盖了 qwen3_5.py 默认 1024)。
+    max_length: int = 1024
+
+
+@dataclass
+class SelfFlowConfig:
+    enabled: bool = True
+    coeff: float = 1.0                     # projection-loss weight
+    teacher_depth: int = -1               # EMA teacher block index (-1 = last)
+    student_depth: int = -1              # student block index (-1 = first)
+    timestep_mode: str = "ratio"          # ratio | random_cleaner | min
+    ratio: float = 0.5                    # paired_t = t * ratio (for ratio mode)
+    mask_ratio: float = 0.5               # per-token timestep masking probability
+    ema_decay: float = 0.9999
+    projector_dim: int | None = None      # None => 2*hidden
+    n_txt: int = 64                       # text token count (for img segment slicing)
+
+
+@dataclass
+class ModelConfig:
+    architecture: str = "mmdit"            # mmdit (dual/single) — Qwen-Image-style
+    hidden_size: int = 1536
+    num_layers: int = 12
+    num_double_layers: int | None = None   # dual-stream count (None => num_layers)
+    num_single_layers: int | None = None   # single-stream count (None => num_layers)
+    num_heads: int = 12
+    head_dim: int | None = None
+    latent_channels: int = 32              # FLUX.2 VAE z=32
+    patch_size: int = 2                    # 2x2 vec-pack
+    in_channels: int = 4                   # RGB+alpha slot (FLUX.2 VAE in=4)
+    out_channels: int = 4
+    rope_theta: float = 2_000.0
+    axes_dims_rope: tuple[int, ...] = (16, 16, 16, 16)
+    guidance_embeds: bool = False
+    flex_attention: bool = False            # use FlexAttention processors in the MMDiT
+    alpha_on: bool = True                  # 4th channel active (dummy now)
+    self_flow: SelfFlowConfig = field(default_factory=SelfFlowConfig)
+    vae: ComponentConfig = field(default_factory=ComponentConfig)
+    qwen_vl: ComponentConfig = field(default_factory=ComponentConfig)
+    transformer: ComponentConfig = field(default_factory=ComponentConfig)
+
+
+@dataclass
+class DataConfig:
+    dataset: str = "parquet"               # parquet streaming
+    root: str = "/mnt/oss/users/lzj/imagenet-ablation/imagenet-1k"
+    split: str = "train"
+    parquet_glob: str = "data/train-*.parquet"
+    image_field: str = "image"
+    caption_field: str = "text"
+    image_size: int = 256
+    bucket: bool = True                    # resolution bucketing
+    aspect_buckets: str = "mar_256"
+    resolution_stride: int = 16
+    alpha: bool = True                     # preserve RGBA else pad ones
+    it2i_mix: float = 0.0                  # 0 = pure t2i; >0 = fraction of edit pairs
+    it2i_parquet: str | None = None
+    num_workers: int = 4
+    shuffle_shards: bool = True
+    overfit_n: int | None = None           # cached overfit set size
+    label_field: str = "label"
+
+
+@dataclass
+class OptimizerConfig:
+    optimizer: str = "muon_adam"           # muon_adam | adamw
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5
+    muon_rms_scale: bool = True
+    muon_weight_decay: float = 0.01
+    adam_lr: float = 3e-4
+    adam_betas: tuple[float, float] = (0.9, 0.95)
+    adam_eps: float = 1e-15
+    adam_weight_decay: float = 0.01
+    adam_fused: bool = False
+
+
+@dataclass
+class TrainConfig:
+    fsdp2: bool = True
+    # Shard the frozen text backbone only inside each node.  This keeps Qwen
+    # collectives on NVLink/NVSwitch even when the training mesh spans nodes.
+    fsdp_text_encoder: bool = False
+    text_encoder_shard_size: int = 8
+    sharding_strategy: str = "FULL_SHARD"  # FULL_SHARD | SHARD_GRAD_OP | HYBRID_SHARD
+    num_replicate: int = 1                  # HSDP 2D mesh replicate dim
+    num_shard: int | None = None            # None => world_size // num_replicate
+    mixed_precision: str = "bf16"
+    reshard_after_forward: bool = True
+    compile: bool = True
+    compile_text_encoder: bool = True       # compile frozen Qwen language backbone too
+    compile_vae: bool = False               # compile fixed-shape frozen VAE encoder
+    compile_dynamic: bool = False           # fixed 1024 text + 256 image tokens
+    compile_mode: str = "default"           # default | reduce-overhead | max-autotune
+    vae_compile_mode: str = "default"
+    # Optional static Qwen sequence-length buckets.  Every rank follows the same
+    # weighted schedule so distributed training never waits on a longer bucket
+    # chosen independently by another rank.
+    text_length_buckets: tuple[int, ...] = ()
+    text_length_bucket_weights: tuple[int, ...] = ()
+    flex_attention: bool = True
+    block_size: int = 128
+    batch_size_per_gpu: int = 16
+    grad_accum: int = 1
+    max_steps: int = 100
+    lr: float = 0.0                         # informational; optimizer lrs in OptimizerConfig
+    warmup_steps: int = 0
+    lr_schedule: str = "constant"           # constant | cosine
+    grad_clip: float = 1.0
+    ckpt_every: int = 2000
+    output_dir: str = "/mnt/oss/users/wfz/uv3-codebase-runs"
+    run_name: str = "run"
+    wandb: bool = False
+    wandb_project: str = "uv3"
+    profile: bool = False
+    log_every: int = 10
+    seed: int = 42
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
+
+@dataclass
+class ExperimentConfig:
+    model: ModelConfig = field(default_factory=ModelConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+
+
+def _construct(cls, raw: dict[str, Any]):
+    """Recursively build a dataclass from a dict, tolerating extra keys."""
+    if not is_dataclass(cls):
+        return raw
+    kwargs = {}
+    raw = raw or {}
+    for f in fields(cls):
+        if f.name not in raw:
+            continue
+        val = raw[f.name]
+        ft = f.type
+        # nested dataclass field?
+        if is_dataclass(ft) and isinstance(val, dict):
+            kwargs[f.name] = _construct(ft, val)
+        else:
+            kwargs[f.name] = val
+    return cls(**kwargs)
+
+
+def load_config(path: str) -> ExperimentConfig:
+    raw = yaml.safe_load(open(path).read()) or {}
+    model_raw = raw.get("model", {}) or {}
+    for name in ("vae", "qwen_vl", "transformer", "self_flow"):
+        if name in model_raw:
+            model_raw[name] = _construct(
+                _field_dataclass(ModelConfig, name), model_raw[name]
+            )
+    cfg = ExperimentConfig(
+        model=_construct(ModelConfig, model_raw),
+        data=_construct(DataConfig, raw.get("data", {})),
+        train=_construct(TrainConfig, raw.get("train", {})),
+    )
+    return cfg
+
+
+def _field_dataclass(parent_cls, field_name: str):
+    for f in fields(parent_cls):
+        if f.name == field_name and is_dataclass(f.type):
+            return f.type
+    raise KeyError(f"{field_name} is not a nested dataclass field of {parent_cls}")

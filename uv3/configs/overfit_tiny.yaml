@@ -1,0 +1,71 @@
+model:
+  architecture: mmdit
+  hidden_size: 768
+  num_layers: 2            # double-stream (dual) count
+  num_double_layers: 2
+  num_single_layers: 2
+  num_heads: 12            # head_dim = 768/12 = 64
+  latent_channels: 32
+  patch_size: 2
+  in_channels: 128
+  out_channels: 128
+  rope_theta: 2000.0
+  guidance_embeds: false
+  alpha_on: false
+  vae:
+    backend: diffusers
+    pretrained: /mnt/data/share/checkpoints/black-forest-labs/FLUX.2-dev
+    subfolder: vae
+    trainable: false
+  qwen_vl:
+    backend: transformers
+    pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-9B
+    trainable: false
+  transformer:
+    backend: random
+    trainable: true
+  self_flow:
+    enabled: false
+    coeff: 1.0
+    ema_decay: 0.9999
+
+data:
+  dataset: parquet
+  root: /mnt/oss/users/lzj/imagenet-ablation/imagenet-1k
+  split: train
+  parquet_glob: "data/train-*.parquet"
+  image_field: image
+  caption_field: text
+  image_size: 256
+  bucket: false
+  alpha: false
+  it2i_mix: 0.0
+  num_workers: 2
+
+train:
+  fsdp2: false
+  mixed_precision: bf16
+  compile: false
+  flex_attention: false
+  batch_size_per_gpu: 8
+  grad_accum: 1
+  max_steps: 100
+  grad_clip: 1.0
+  ckpt_every: 100000
+  output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
+  run_name: overfit_tiny
+  wandb: false
+  log_every: 5
+  seed: 42
+  optimizer:
+    optimizer: muon_adam
+    muon_lr: 1.0e-4
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_rms_scale: true
+    muon_weight_decay: 0.0
+    adam_lr: 1.0e-4
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    adam_weight_decay: 0.0

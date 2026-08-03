@@ -1,0 +1,43 @@
+model:
+  architecture: mmdit
+  hidden_size: 4096
+  num_layers: 4
+  num_double_layers: 4
+  num_single_layers: 24
+  num_heads: 32
+  latent_channels: 32
+  patch_size: 2
+  rope_theta: 2000.0
+  guidance_embeds: false
+  flex_attention: true
+  alpha_on: false
+  vae: {backend: diffusers, pretrained: /mnt/data/share/checkpoints/black-forest-labs/FLUX.2-dev, subfolder: vae, trainable: false}
+  qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-9B, trainable: false, max_length: 1024}
+  transformer: {backend: random, trainable: true}
+  self_flow: {enabled: true, coeff: 1.0, ema_decay: 0.9999, mask_ratio: 0.5, ratio: 0.5, timestep_mode: ratio}
+data:
+  dataset: tar
+  root: /mnt/oss/uv3-pretrain-manifect/0803-test/manifect.jsonl
+  image_size: 256
+  caption_field: caption_qwen3_7_flash
+  num_workers: 4
+train:
+  fsdp2: true
+  num_replicate: 1
+  reshard_after_forward: true
+  mixed_precision: bf16
+  compile: true
+  compile_text_encoder: true
+  compile_dynamic: false
+  compile_mode: default
+  flex_attention: true
+  batch_size_per_gpu: 5
+  grad_accum: 1
+  max_steps: 120
+  grad_clip: 1.0
+  ckpt_every: 100000
+  output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
+  run_name: bench_real_7b_8gpu_20260803
+  log_every: 10
+  seed: 42
+  optimizer: {optimizer: muon_adam, muon_lr: 1.0e-4, muon_momentum: 0.95, muon_nesterov: true, muon_ns_steps: 5, muon_rms_scale: true, muon_weight_decay: 0.0, adam_lr: 1.0e-4, adam_betas: [0.9, 0.95], adam_eps: 1.0e-8, adam_weight_decay: 0.0}

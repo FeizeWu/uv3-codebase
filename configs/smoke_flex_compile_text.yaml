@@ -1,0 +1,45 @@
+model:
+  architecture: mmdit
+  hidden_size: 256
+  num_layers: 1
+  num_double_layers: 1
+  num_single_layers: 1
+  num_heads: 4
+  latent_channels: 32
+  patch_size: 2
+  rope_theta: 2000.0
+  guidance_embeds: false
+  flex_attention: true
+  alpha_on: false
+  vae: {backend: diffusers, pretrained: /mnt/data/share/checkpoints/black-forest-labs/FLUX.2-dev, trainable: false}
+  qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-9B, trainable: false, max_length: 1024}
+  transformer: {backend: random, trainable: true}
+  self_flow: {enabled: false}
+data:
+  dataset: parquet
+  root: /mnt/oss/users/lzj/imagenet-ablation/imagenet-1k
+  split: train
+  parquet_glob: "data/train-*.parquet"
+  image_field: image
+  image_size: 256
+  num_workers: 2
+  label_field: label
+train:
+  fsdp2: false
+  mixed_precision: bf16
+  compile: true
+  compile_text_encoder: true
+  compile_dynamic: false
+  compile_mode: default
+  flex_attention: true
+  block_size: 128
+  batch_size_per_gpu: 2
+  grad_accum: 1
+  max_steps: 2
+  grad_clip: 1.0
+  ckpt_every: 100000
+  output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
+  run_name: smoke_flex_compile_text
+  log_every: 1
+  seed: 42
+  optimizer: {optimizer: muon_adam, muon_lr: 1.0e-4, muon_momentum: 0.95, muon_nesterov: true, muon_ns_steps: 5, muon_rms_scale: true, muon_weight_decay: 0.0, adam_lr: 1.0e-4, adam_betas: [0.9, 0.95], adam_eps: 1.0e-8, adam_weight_decay: 0.0}

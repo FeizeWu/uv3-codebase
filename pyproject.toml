@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uv3"
+version = "0.1.0"
+description = "Industrial multimodal pretraining: Muon + Self-Flow + MMDiT + Qwen3.5-VL"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.12",
+  "diffusers>=0.39",
+  "transformers>=5.14",
+  "accelerate>=1.14",
+  "einops>=0.8",
+  "pyarrow>=22",
+  "safetensors>=0.8",
+  "wandb>=0.27",
+  "modelscope>=1.37",
+  "pyyaml>=6",
+  "numpy",
+  "pillow",
+  "scipy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["uv3*"]

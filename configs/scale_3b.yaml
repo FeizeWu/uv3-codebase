@@ -1,0 +1,56 @@
+# 规模实测:3B 真数据(3.13B),1024-token caption,self-flow on,500步
+model:
+  architecture: mmdit
+  hidden_size: 3072
+  num_layers: 4
+  num_double_layers: 4
+  num_single_layers: 16
+  num_heads: 24           # head_dim = 128
+  latent_channels: 32
+  patch_size: 2
+  in_channels: 128
+  out_channels: 128
+  rope_theta: 2000.0
+  axes_dims_rope: [16, 16, 16, 16]
+  guidance_embeds: false
+  flex_attention: true
+  alpha_on: false
+  vae: {backend: diffusers, pretrained: /mnt/data/share/checkpoints/black-forest-labs/FLUX.2-dev, subfolder: vae, trainable: false}
+  qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-9B, trainable: false, max_length: 1024}
+  transformer: {backend: random, trainable: true}
+  self_flow:
+    enabled: true
+    coeff: 1.0
+    ema_decay: 0.9999
+    mask_ratio: 0.5
+    ratio: 0.5
+    timestep_mode: ratio
+data:
+  dataset: tar
+  root: /mnt/oss/uv3-pretrain-manifect/0803-test/manifect.jsonl
+  image_size: 256
+  caption_field: caption_qwen3_7_flash
+  num_workers: 4
+train:
+  fsdp2: true
+  sharding_strategy: FULL_SHARD
+  num_replicate: 1
+  mixed_precision: bf16
+  reshard_after_forward: true
+  compile: true
+  compile_text_encoder: true
+  compile_dynamic: false
+  compile_mode: default
+  flex_attention: true
+  block_size: 128
+  batch_size_per_gpu: 8        # 3B+teacher+Qwen9B batch16 OOM(GPU7 仅49GB free),降8
+  grad_accum: 1
+  max_steps: 500
+  grad_clip: 1.0
+  ckpt_every: 250
+  output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
+  run_name: scale_3b_1024
+  wandb: false
+  log_every: 10
+  seed: 42
+  optimizer: {optimizer: muon_adam, muon_lr: 1.0e-4, muon_momentum: 0.95, muon_nesterov: true, muon_ns_steps: 5, muon_rms_scale: true, muon_weight_decay: 0.0, adam_lr: 1.0e-4, adam_betas: [0.9, 0.95], adam_eps: 1.0e-8, adam_weight_decay: 0.0}

@@ -1,0 +1,21 @@
+.venv/
+.venv-*/
+*.egg-info/
+__pycache__/
+*.py[cod]
+._*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local checkpoints, benchmark outputs, and compiler caches.
+*.pt
+*.pth
+*.ckpt
+outputs/
+runs/
+torch_compile_debug/
+
+# Local scratch/backup copies are not source history.
+.backup-*/
+*.bak-*
