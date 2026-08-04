@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep the five Qwen/MMDiT static graphs off the small system /tmp partition.
-export TORCHINDUCTOR_CACHE_DIR="${UV3_COMPILE_CACHE_DIR:-/mnt/data/users/wfz/torchinductor-cache-uv3}"
+# Keep the five Qwen/MMDiT static graphs off both the small system /tmp and the
+# metadata-bound shared CPFS. Override this for a prepared node-local cache.
+export TORCHINDUCTOR_CACHE_DIR="${UV3_COMPILE_CACHE_DIR:-/dev/shm/uv3-inductor-cache}"
 # 8 ranks x torch's default 32 workers oversubscribes this 184-CPU host.
 export TORCHINDUCTOR_COMPILE_THREADS="${UV3_COMPILE_THREADS:-8}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"

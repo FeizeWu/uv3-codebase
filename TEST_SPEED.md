@@ -222,7 +222,7 @@ torchao 的 `enable_fsdp_float8_all_gather` 先通过 2 卡缩小模型验证：
 | G | FP8 权重 FSDP all-gather | packed scale -3.45%；**逐层 scale -0.11%** | **完成；仅作省显存开关** | no-precompute 省 2.17 GiB 且吞吐基本持平；32 台稳态 6.28 天 |
 | H | 节点内 8 卡 shard、节点间 replicate 的 HSDP | 单机不变；改善多机扩展 | **实现并通过 2D mesh 烟测；待真实多机测速** | `num_shard: 8` 在 256 卡自动生成 `(replicate=32, shard=8)` |
 
-编译缓存不能放系统 `/tmp`：实测旧 `/tmp/torchinductor_root` 累计达到 13 GiB 并触发 `ENOSPC`；清理后源码、数据和 checkpoint 均未受影响。持久缓存曾迁移到 `/mnt/data/users/wfz/torchinductor-cache-uv3`，但该 CPFS 当前 95% 满，首次新图编译时大量 worker 进入 `D` 状态等待 I/O。相同 FP8 all-gather 新图改用 `/dev/shm/uv3-inductor-fp8-ag` 后，冷启动完整 50 step 只用 11 分 18.7 秒；共享盘版本运行 4 分钟仍未完成 step 0，而此前普通 MMDiT FP8 在共享盘首次到 step 10 约 20.5 分钟。本地缓存最终约 8.5 GiB、20.25 万文件。单机实验推荐 `/dev/shm`；多机正式训练应先生成一次缓存，再在每个节点本地 staging，避免所有节点直接随机读写 CPFS。机器有 184 CPU，torch 默认每 rank 32 个编译线程会形成 256 线程过度订阅；推荐设置 `TORCHINDUCTOR_COMPILE_THREADS=8`，总计 64 个编译线程。冷启动不混入 step 30→40 的吞吐。
+编译缓存不能放系统 `/tmp`：实测旧 `/tmp/torchinductor_root` 累计达到 13 GiB 并触发 `ENOSPC`；清理后源码、数据和 checkpoint 均未受影响。持久缓存曾迁移到 `/mnt/data/users/wfz/torchinductor-cache-uv3`，但该 CPFS 当前 95% 满，首次新图编译时大量 worker 进入 `D` 状态等待 I/O。相同 FP8 all-gather 新图改用 `/dev/shm/uv3-inductor-fp8-ag` 后，冷启动完整 50 step 只用 11 分 18.7 秒；共享盘版本运行 4 分钟仍未完成 step 0，而此前普通 MMDiT FP8 在共享盘首次到 step 10 约 20.5 分钟。本地缓存最终约 8.5 GiB、20.25 万文件。`scripts/launch_3b_best.sh` 现默认使用 `/dev/shm/uv3-inductor-cache`，仍可用 `UV3_COMPILE_CACHE_DIR` 覆盖。多机正式训练可让各节点并行生成本地缓存，或先生成一次再做节点本地 staging，避免所有节点直接随机读写 CPFS。机器有 184 CPU，torch 默认每 rank 32 个编译线程会形成 256 线程过度订阅；推荐设置 `TORCHINDUCTOR_COMPILE_THREADS=8`，总计 64 个编译线程。冷启动不混入 step 30→40 的吞吐。
 
 BS14/16 都是新的 batch 静态形状，五个文本桶也都需要生成新图；在 8 rank、每 rank 8 个编译线程下，首次启动到五桶完成并进入稳态 warmup 约需 18～20 分钟。这个成本不会影响长时训练的稳态吞吐，但频繁更换 batch size 时不可忽略，因此 batch sweep 每个点都保留独立配置和缓存。
 
