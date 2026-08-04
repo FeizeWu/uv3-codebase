@@ -351,6 +351,9 @@ def _maybe_convert_mmdit_fp8(mmdit, cfg, rank):
     fp8_fsdp_all_gather = bool(
         getattr(cfg.train, "mmdit_fp8_fsdp_all_gather", False)
     )
+    fp8_precompute_scale = bool(
+        getattr(cfg.train, "mmdit_fp8_precompute_scale", True)
+    )
     convert_to_float8_training(
         mmdit,
         module_filter_fn=token_block_linear,
@@ -364,7 +367,8 @@ def _maybe_convert_mmdit_fp8(mmdit, cfg, rank):
         )
         print(
             f"[train] MMDiT FP8 ON: token-block Linear layers={converted} "
-            f"fsdp_float8_all_gather={fp8_fsdp_all_gather}",
+            f"fsdp_float8_all_gather={fp8_fsdp_all_gather} "
+            f"precompute_scale={fp8_precompute_scale}",
             flush=True,
         )
 
@@ -396,6 +400,9 @@ def train(cfg: ExperimentConfig):
         from torchao.float8.fsdp_utils import (
             precompute_float8_dynamic_scale_for_fsdp,
         )
+    fp8_precompute_scale = fp8_fsdp_all_gather and bool(
+        getattr(cfg.train, "mmdit_fp8_precompute_scale", True)
+    )
 
     # Build the EMA teacher before FSDP so student and teacher can be sharded with
     # identical module boundaries and DTensor placements.  This lets EMA update
@@ -651,7 +658,7 @@ def train(cfg: ExperimentConfig):
                     torch.nn.utils.clip_grad_norm_(projector.parameters(), cfg.train.grad_clip)
             for o in optimizers.values():
                 o.step()                                             # optimizer
-            if fp8_fsdp_all_gather:
+            if fp8_precompute_scale:
                 precompute_float8_dynamic_scale_for_fsdp(mmdit)
             for o in optimizers.values():
                 o.zero_grad()

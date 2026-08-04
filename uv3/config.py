@@ -123,6 +123,9 @@ class TrainConfig:
     # Communicate trainable FP8 weights directly during FSDP all-gather instead
     # of expanding their local shards to BF16 first.  Requires mmdit_fp8 + FSDP2.
     mmdit_fp8_fsdp_all_gather: bool = False
+    # Pack all dynamic FP8 weight scales into one all-reduce after optimizer.step.
+    # If false, torchao computes/reduces a scale in each FSDP pre-all-gather.
+    mmdit_fp8_precompute_scale: bool = True
     # None inherits compile_mode for backward compatibility. Set explicitly to
     # benchmark MMDiT compiler modes without changing the frozen Qwen graphs.
     text_encoder_compile_mode: str | None = None

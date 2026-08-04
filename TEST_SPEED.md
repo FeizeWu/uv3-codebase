@@ -155,6 +155,7 @@ torchao `Float8Linear` 同时量化 forward 的 input/weight，以及 backward �
 | + Qwen 中间 24 层 MLP FP8 | **1.778 秒** | **53.98 样本/秒** | **+36.51%** | 1.692 秒 | 57.47 GiB | 1.406590 |
 | + Qwen 全 Linear FP8（速度上限） | **1.581 秒** | **60.72 样本/秒** | **+53.55%** | 1.501 秒 | 54.38 GiB | 1.406667 |
 | 上一行 + FP8 FSDP all-gather（不推荐） | 1.637 秒 | 58.63 样本/秒 | **+48.26%（相对上一行 -3.45%）** | 1.471 秒 | **52.01 GiB** | 1.406603 |
+| FP8 all-gather，不预计算 scale | **1.583 秒** | **60.66 样本/秒** | **+53.38%（相对全 FP8 -0.11%）** | 1.494 秒 | **52.22 GiB** | 1.406658 |
 | 上一行改为 BS16（不推荐） | 2.195 秒 | 58.31 样本/秒 | **+47.45%（相对 BS12 -3.97%）** | 2.067 秒 | 64.44 GiB | 1.362466¹ |
 
 ¹ BS16 每步样本和 batch 内容不同，loss 不能与 BS12 对位比较，只检查 finite/下降趋势。
@@ -163,18 +164,20 @@ MMDiT FP8 首次五桶编译到 step 10 约 20.5 分钟；两边 FP8 图均缓�
 
 全 FP8 显存下降后重新测试 BS16：峰值增加 10.05 GiB，step 从 1.581 增到 2.195 秒，吞吐反而从 60.72 降到 58.31 样本/秒（-3.97%），32 台从 6.27 恶化到 6.53 天。新 batch shape 的五桶首次编译约 23.7 分钟。FP8 scaled-mm 也没有从更大 M 维获得额外利用率，BS12 继续作为推荐；不再为缺乏趋势的 BS14/18 生成另一套昂贵图。
 
-torchao 的 `enable_fsdp_float8_all_gather` 先通过 2 卡缩小模型验证：FSDP2 + compile + Flex Attention 连续 3 次前反向均 finite，loss 从 2.3441 降到 2.3207。正式 3B 测试每次 optimizer step 后调用 `precompute_float8_dynamic_scale_for_fsdp`，把 80 层的动态 weight scale 合并为一次 all-reduce。严格 step 30→40 结果却从 60.72 降至 58.63 样本/秒（-3.45%），可见 clip/optimizer/scale 段从约 0.132 增到 0.159 秒/step；峰值只省 2.37 GiB。单机 NVLink/NVSwitch 已很快，FP8 weight subclass、cast 与 scale 同步成本超过减半 all-gather 字节的收益，因此默认关闭。它在跨机 FULL_SHARD 下可能有价值，但推荐的多机拓扑是节点内 8 卡 shard、节点间 replicate，仍不应让该通信跨机器。
+torchao 的 `enable_fsdp_float8_all_gather` 先通过 2 卡缩小模型验证：FSDP2 + compile + Flex Attention 连续 3 次前反向均 finite，loss 从 2.3441 降到 2.3207。正式 3B 首测每次 optimizer step 后调用 `precompute_float8_dynamic_scale_for_fsdp`，把 80 层的动态 weight scale 合并为一次 all-reduce。严格 step 30→40 结果却从 60.72 降至 58.63 样本/秒（-3.45%），可见 clip/optimizer/scale 段从约 0.132 增到 0.159 秒/step；峰值省 2.37 GiB。
+
+随后关闭 packed scale 预计算，让 torchao 在各层 `fsdp_pre_all_gather` 内动态求 amax/sync。相同窗口恢复到 60.66 样本/秒，只比未压缩全 FP8 低 0.11%，可见 step 段回到约 0.137 秒/step，同时仍省 2.17 GiB。这里逐层 scale 工作被 FSDP 执行路径更好地流水化，一次集中同步反而暴露在关键路径上。结论是：单机默认仍关闭 all-gather 压缩，因为它没有确定加速；若需要多省约 2 GiB，可开启 all-gather 并设置 `mmdit_fp8_precompute_scale: false`，吞吐基本不变。packed scale 模式在当前节点内 NVLink/NVSwitch 拓扑下淘汰。跨机也应优先采用节点内 8 卡 shard、节点间 replicate，不让每层参数 all-gather 经过 IB。
 
 按相同多机扩展效率估算：
 
-| 机器数 | GPU 数 | MMDiT FP8 + BF16 Qwen | + 中间 24 层 Qwen FP8 | 全 Qwen + MMDiT FP8 | + FP8 all-gather（不推荐） |
+| 机器数 | GPU 数 | MMDiT FP8 + BF16 Qwen | + 中间 24 层 Qwen FP8 | 全 Qwen + MMDiT FP8 | + FP8 all-gather/no-precompute |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 8 | 240.27 天 | **214.40 天** | **190.60 天** | 197.41 天 |
-| 2 | 16 | 121.35 天 | **108.28 天** | **96.26 天** | 99.70 天 |
-| 4 | 32 | 61.29 天 | **54.69 天** | **48.62 天** | 50.36 天 |
-| 8 | 64 | 30.96 天 | **27.63 天** | **24.56 天** | 25.44 天 |
-| 16 | 128 | 15.64 天 | **13.96 天** | **12.41 天** | 12.85 天 |
-| 32 | 256 | **7.90 天** | **7.05 天** | **6.27 天** | 6.49 天 |
+| 1 | 8 | 240.27 天 | **214.40 天** | **190.60 天** | 190.81 天 |
+| 2 | 16 | 121.35 天 | **108.28 天** | **96.26 天** | 96.37 天 |
+| 4 | 32 | 61.29 天 | **54.69 天** | **48.62 天** | 48.67 天 |
+| 8 | 64 | 30.96 天 | **27.63 天** | **24.56 天** | 24.59 天 |
+| 16 | 128 | 15.64 天 | **13.96 天** | **12.41 天** | 12.42 天 |
+| 32 | 256 | **7.90 天** | **7.05 天** | **6.27 天** | 6.28 天 |
 
 阶段一组合（尚未让 MMDiT 使用真实桶长）相对原五桶 baseline 的端到端吞吐累计提升 2.51%。加入 MMDiT 五桶后的**新推荐组合**累计吞吐提升 **20.42%**，单步时间下降 **16.96%**。按 1B 图文样本估算：
 
@@ -216,7 +219,7 @@ torchao 的 `enable_fsdp_float8_all_gather` 先通过 2 卡缩小模型验证：
 | D | 审计 grad norm，测试关闭或降低 grad-clip 频率 | **实测 -0.09%** | **完成，不进入基线** | 41 步仅首步触发；省下的可见时间被异步等待抵消，且长训有风险 |
 | E | Qwen FP8 推理 | **中间 MLP +9.57%；全 MLP +13.57%；全量 +19.43%** | **完成性能/短程测试；待长程质量放行** | 三档 32 台为 8.68/8.37/7.96 天；优先验证中间 24 层 |
 | F | MMDiT FP8 训练 | **单独 +21.81%；叠加后最高 +53.55%** | **完成性能/短程测试；待长程收敛放行** | 只转 80 个 token-block Linear；32 台单独 7.90 天、全 FP8 6.27 天 |
-| G | FP8 权重 FSDP all-gather | **相对全 FP8 -3.45%** | **完成，不进入单机基线** | 省 2.37 GiB，但 scale/cast 成本超过 NVLink 通信收益；32 台稳态 6.49 天 |
+| G | FP8 权重 FSDP all-gather | packed scale -3.45%；**逐层 scale -0.11%** | **完成；仅作省显存开关** | no-precompute 省 2.17 GiB 且吞吐基本持平；32 台稳态 6.28 天 |
 
 编译缓存不能放系统 `/tmp`：实测旧 `/tmp/torchinductor_root` 累计达到 13 GiB 并触发 `ENOSPC`；清理后源码、数据和 checkpoint 均未受影响。持久缓存曾迁移到 `/mnt/data/users/wfz/torchinductor-cache-uv3`，但该 CPFS 当前 95% 满，首次新图编译时大量 worker 进入 `D` 状态等待 I/O。相同 FP8 all-gather 新图改用 `/dev/shm/uv3-inductor-fp8-ag` 后，冷启动完整 50 step 只用 11 分 18.7 秒；共享盘版本运行 4 分钟仍未完成 step 0，而此前普通 MMDiT FP8 在共享盘首次到 step 10 约 20.5 分钟。本地缓存最终约 8.5 GiB、20.25 万文件。单机实验推荐 `/dev/shm`；多机正式训练应先生成一次缓存，再在每个节点本地 staging，避免所有节点直接随机读写 CPFS。机器有 184 CPU，torch 默认每 rank 32 个编译线程会形成 256 线程过度订阅；推荐设置 `TORCHINDUCTOR_COMPILE_THREADS=8`，总计 64 个编译线程。冷启动不混入 step 30→40 的吞吐。
 
@@ -236,7 +239,7 @@ BS14/16 都是新的 batch 静态形状，五个文本桶也都需要生成新�
 | 6 | MMDiT `max-autotune-no-cudagraphs` | **实测 +1.22%** | 低 | 长训练可选；五桶首次搜索约 71 分钟，普通 `max-autotune` 因隐含 CUDA Graph 不采用 |
 | 7 | Qwen FP8 推理 | **实测 +9.57%～+19.43%** | 中 | 三档 32 台为 8.68/8.37/7.96 天；短程 loss 正常，但真实特征 rel-L2 为 4.67%～12.14%，待长程质量放行 |
 | 8 | MMDiT FP8 训练 | **单独实测 +21.81%；全 FP8 组合 +53.55%** | 高 | 80 个 token-block Linear；50 step finite，全 FP8 32 台 6.27 天，仍需长程收敛验证 |
-| 9 | FP8 FSDP all-gather | **实测 -3.45%** | 中 | 单机淘汰；只在不得不跨机 FULL_SHARD 时重新测，节点内 shard 不启用 |
+| 9 | FP8 FSDP all-gather | packed scale -3.45%；**no-precompute -0.11%** | 中 | 默认关闭；缺约 2 GiB 时可用 no-precompute，不能启用集中 scale 同步 |
 | 10 | 文本 token resampler，将 1024 tokens 压缩到 128～256 | 20%～40% | 高 | 可显著缩短 16 个 single-stream block 的序列，但属于模型架构变化 |
 
 多机训练应让 MMDiT 使用节点内 8 卡 shard、节点间 replicate 的 HSDP mesh，避免每层参数 all-gather 跨机器；该项主要改善多机扩展效率，不改变单机结果。
