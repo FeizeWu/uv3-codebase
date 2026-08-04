@@ -162,6 +162,8 @@ torchao `Float8Linear` 同时量化 forward 的 input/weight，以及 backward �
 
 MMDiT FP8 首次五桶编译到 step 10 约 20.5 分钟；两边 FP8 图均缓存后，全 FP8 组合从启动到完成 50 step 约 3.4 分钟。当前没有开启 `enable_fsdp_float8_all_gather`，所以收益来自本地 FP8 GEMM，不依赖压缩 FSDP 通信。50-step loss 和梯度均 finite，但这仍不能替代长程收敛验证：MMDiT FP8 直接改变训练梯度，风险高于冻结 Qwen FP8，三种结果都应视为性能候选而非已证明等质量。
 
+全 FP8 组合也尝试了 MMDiT `max-autotune-no-cudagraphs`。8 rank 使用节点本地 `/dev/shm` 缓存、每 rank 8 个编译线程，冷启动 **58 分 32 秒仍只完成四个桶，未进入 step 30→40 稳态窗口**，因此没有可报告的吞吐数字，也不进入推荐配置。搜索日志显示每个 FP8 `scaled_mm` 最多测试 106 个候选，而大量默认 `_scaled_mm` 已是最优或只慢约 0%～1%；全量搜索的预期收益不足以覆盖五桶冷启动和约 60 GiB 节点本地缓存成本。BF16 MMDiT 的 +1.22% 结果不能直接外推到 full FP8；后续若继续，只应定向调优 Flex Attention，避免重新搜索所有 FP8 GEMM。
+
 全 FP8 显存下降后重新测试 BS16：峰值增加 10.05 GiB，step 从 1.581 增到 2.195 秒，吞吐反而从 60.72 降到 58.31 样本/秒（-3.97%），32 台从 6.27 恶化到 6.53 天。新 batch shape 的五桶首次编译约 23.7 分钟。FP8 scaled-mm 也没有从更大 M 维获得额外利用率，BS12 继续作为推荐；不再为缺乏趋势的 BS14/18 生成另一套昂贵图。
 
 torchao 的 `enable_fsdp_float8_all_gather` 先通过 2 卡缩小模型验证：FSDP2 + compile + Flex Attention 连续 3 次前反向均 finite，loss 从 2.3441 降到 2.3207。正式 3B 首测每次 optimizer step 后调用 `precompute_float8_dynamic_scale_for_fsdp`，把 80 层的动态 weight scale 合并为一次 all-reduce。严格 step 30→40 结果却从 60.72 降至 58.63 样本/秒（-3.45%），可见 clip/optimizer/scale 段从约 0.132 增到 0.159 秒/step；峰值省 2.37 GiB。
@@ -221,6 +223,7 @@ torchao 的 `enable_fsdp_float8_all_gather` 先通过 2 卡缩小模型验证：
 | F | MMDiT FP8 训练 | **单独 +21.81%；叠加后最高 +53.55%** | **完成性能/短程测试；待长程收敛放行** | 只转 80 个 token-block Linear；32 台单独 7.90 天、全 FP8 6.27 天 |
 | G | FP8 权重 FSDP all-gather | packed scale -3.45%；**逐层 scale -0.11%** | **完成；仅作省显存开关** | no-precompute 省 2.17 GiB 且吞吐基本持平；32 台稳态 6.28 天 |
 | H | 节点内 8 卡 shard、节点间 replicate 的 HSDP | 单机不变；改善多机扩展 | **实现并通过 2D mesh 烟测；待真实多机测速** | `num_shard: 8` 在 256 卡自动生成 `(replicate=32, shard=8)` |
+| I | full FP8 + MMDiT `max-autotune-no-cudagraphs` | 稳态未取得 | **停止，不进入推荐** | 58.5 分钟仍未完成五桶；多数 FP8 GEMM 默认内核已接近搜索最优 |
 
 编译缓存不能放系统 `/tmp`：实测旧 `/tmp/torchinductor_root` 累计达到 13 GiB 并触发 `ENOSPC`；清理后源码、数据和 checkpoint 均未受影响。持久缓存曾迁移到 `/mnt/data/users/wfz/torchinductor-cache-uv3`，但该 CPFS 当前 95% 满，首次新图编译时大量 worker 进入 `D` 状态等待 I/O。相同 FP8 all-gather 新图改用 `/dev/shm/uv3-inductor-fp8-ag` 后，冷启动完整 50 step 只用 11 分 18.7 秒；共享盘版本运行 4 分钟仍未完成 step 0，而此前普通 MMDiT FP8 在共享盘首次到 step 10 约 20.5 分钟。本地缓存最终约 8.5 GiB、20.25 万文件。`scripts/launch_3b_best.sh` 现默认使用 `/dev/shm/uv3-inductor-cache`，仍可用 `UV3_COMPILE_CACHE_DIR` 覆盖。多机正式训练可让各节点并行生成本地缓存，或先生成一次再做节点本地 staging，避免所有节点直接随机读写 CPFS。机器有 184 CPU，torch 默认每 rank 32 个编译线程会形成 256 线程过度订阅；推荐设置 `TORCHINDUCTOR_COMPILE_THREADS=8`，总计 64 个编译线程。冷启动不混入 step 30→40 的吞吐。
 
