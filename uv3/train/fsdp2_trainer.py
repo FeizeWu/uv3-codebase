@@ -348,17 +348,23 @@ def _maybe_convert_mmdit_fp8(mmdit, cfg, rank):
             or ".single_transformer_blocks." in qualified
         )
 
+    fp8_fsdp_all_gather = bool(
+        getattr(cfg.train, "mmdit_fp8_fsdp_all_gather", False)
+    )
     convert_to_float8_training(
         mmdit,
         module_filter_fn=token_block_linear,
-        config=Float8LinearConfig(),
+        config=Float8LinearConfig(
+            enable_fsdp_float8_all_gather=fp8_fsdp_all_gather,
+        ),
     )
     if rank == 0:
         converted = sum(
             type(module).__name__ == "Float8Linear" for module in mmdit.modules()
         )
         print(
-            f"[train] MMDiT FP8 ON: token-block Linear layers={converted}",
+            f"[train] MMDiT FP8 ON: token-block Linear layers={converted} "
+            f"fsdp_float8_all_gather={fp8_fsdp_all_gather}",
             flush=True,
         )
 
@@ -378,6 +384,18 @@ def train(cfg: ExperimentConfig):
     vae, qwen, mmdit = build(cfg, dev, dtype)
     _maybe_quantize_text_encoder_fp8(qwen, cfg, rank)
     _maybe_convert_mmdit_fp8(mmdit, cfg, rank)
+    fp8_fsdp_all_gather = bool(
+        getattr(cfg.train, "mmdit_fp8", False)
+        and getattr(cfg.train, "mmdit_fp8_fsdp_all_gather", False)
+        and distributed
+        and cfg.train.fsdp2
+    )
+    if fp8_fsdp_all_gather:
+        # One packed scale all-reduce per optimizer step is substantially cheaper
+        # than allowing every Float8Linear weight to reduce its scale separately.
+        from torchao.float8.fsdp_utils import (
+            precompute_float8_dynamic_scale_for_fsdp,
+        )
 
     # Build the EMA teacher before FSDP so student and teacher can be sharded with
     # identical module boundaries and DTensor placements.  This lets EMA update
@@ -633,6 +651,8 @@ def train(cfg: ExperimentConfig):
                     torch.nn.utils.clip_grad_norm_(projector.parameters(), cfg.train.grad_clip)
             for o in optimizers.values():
                 o.step()                                             # optimizer
+            if fp8_fsdp_all_gather:
+                precompute_float8_dynamic_scale_for_fsdp(mmdit)
             for o in optimizers.values():
                 o.zero_grad()
             # EMA matching local shards. Student and teacher use the same FSDP2
