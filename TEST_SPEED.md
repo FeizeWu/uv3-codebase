@@ -142,6 +142,32 @@ AdamW + 关闭 self-flow 相比 Muon + self-flow 综合提速约 **1.44 倍**，
 
 三种 FP8 方案在 50-step 同 seed 训练中的 step 40 loss 分别为 1.406742 / 1.406670 / 1.406674，BF16 为 1.406734，短程没有可见发散。但随机初始化 MMDiT 的短程 loss 不能证明冻结文本特征误差不会影响最终质量：中间 24 层是质量优先候选，全部 MLP 是速度/误差平衡候选，全 Linear 只作为速度上限；正式 1B 训练前仍需用下游指标或更长 loss A/B 放行。
 
+### MMDiT token-block FP8 训练
+
+torchao `Float8Linear` 同时量化 forward 的 input/weight，以及 backward 的 grad-output。直接转换所有 MMDiT Linear 的缩小模型烟测失败：`norm_out.linear` 等时间条件/调制层只处理原始 batch 维，BS=12 不满足 scaled-mm 的 16 对齐约束。正式实现只转换 4 个 double block 和 16 个 single block 内共 80 个 token 级 Linear；文本/图片序列均为 128 的倍数，排除 batch-only 小矩阵后，缩小模型的 Flex Attention + compile + 3 次 backward 全部 finite。
+
+严格 3B/8 卡结果使用 MMDiT `compile_mode=default`；第一行保持 Qwen BF16 来隔离 MMDiT FP8，后两行再叠加 Qwen FP8：
+
+| 配置 | wall-clock/step | 单机吞吐 | 相对 BF16/default | 训练计算段/step | 峰值显存/卡 | step 40 loss |
+|---|---:|---:|---:|---:|---:|---:|
+| BF16 MMDiT + BF16 Qwen | 2.428 秒 | 39.55 样本/秒 | — | 2.321 秒 | 67.03 GiB | 1.4067 |
+| **token-block FP8 MMDiT + BF16 Qwen** | **1.993 秒** | **48.17 样本/秒** | **+21.81%** | 1.910 秒 | 60.90 GiB | 1.406622 |
+| + Qwen 中间 24 层 MLP FP8 | **1.778 秒** | **53.98 样本/秒** | **+36.51%** | 1.692 秒 | 57.47 GiB | 1.406590 |
+| + Qwen 全 Linear FP8（速度上限） | **1.581 秒** | **60.72 样本/秒** | **+53.55%** | 1.501 秒 | 54.38 GiB | 1.406667 |
+
+MMDiT FP8 首次五桶编译到 step 10 约 20.5 分钟；两边 FP8 图均缓存后，全 FP8 组合从启动到完成 50 step 约 3.4 分钟。当前没有开启 `enable_fsdp_float8_all_gather`，所以收益来自本地 FP8 GEMM，不依赖压缩 FSDP 通信。50-step loss 和梯度均 finite，但这仍不能替代长程收敛验证：MMDiT FP8 直接改变训练梯度，风险高于冻结 Qwen FP8，三种结果都应视为性能候选而非已证明等质量。
+
+按相同多机扩展效率估算：
+
+| 机器数 | GPU 数 | MMDiT FP8 + BF16 Qwen | + 中间 24 层 Qwen FP8 | 全 Qwen + MMDiT FP8 |
+|---:|---:|---:|---:|---:|
+| 1 | 8 | 240.27 天 | **214.40 天** | **190.60 天** |
+| 2 | 16 | 121.35 天 | **108.28 天** | **96.26 天** |
+| 4 | 32 | 61.29 天 | **54.69 天** | **48.62 天** |
+| 8 | 64 | 30.96 天 | **27.63 天** | **24.56 天** |
+| 16 | 128 | 15.64 天 | **13.96 天** | **12.41 天** |
+| 32 | 256 | **7.90 天** | **7.05 天** | **6.27 天** |
+
 阶段一组合（尚未让 MMDiT 使用真实桶长）相对原五桶 baseline 的端到端吞吐累计提升 2.51%。加入 MMDiT 五桶后的**新推荐组合**累计吞吐提升 **20.42%**，单步时间下降 **16.96%**。按 1B 图文样本估算：
 
 | 机器数 | GPU 数 | 五桶 baseline | 阶段一组合 | 新推荐组合（BS12） | BS14 实测 | BS16 实测 | MMDiT max-autotune¹ |
@@ -181,7 +207,7 @@ AdamW + 关闭 self-flow 相比 Muon + self-flow 综合提速约 **1.44 倍**，
 | C | 分离 Qwen/MMDiT mode，测试 MMDiT `reduce-overhead` / `max-autotune` | -60.18% / **+1.22%** | **完成；无 Graph 的 max-autotune 作为长训练可选项** | 五桶冷启动约 71 分钟；32 台含冷启动约 9.56 天 |
 | D | 审计 grad norm，测试关闭或降低 grad-clip 频率 | **实测 -0.09%** | **完成，不进入基线** | 41 步仅首步触发；省下的可见时间被异步等待抵消，且长训有风险 |
 | E | Qwen FP8 推理 | **中间 MLP +9.57%；全 MLP +13.57%；全量 +19.43%** | **完成性能/短程测试；待长程质量放行** | 三档 32 台为 8.68/8.37/7.96 天；优先验证中间 24 层 |
-| F | MMDiT FP8 训练 | 15%～30% | 待测 | 速度、显存、loss/梯度稳定性共同通过 |
+| F | MMDiT FP8 训练 | **单独 +21.81%；叠加后最高 +53.55%** | **完成性能/短程测试；待长程收敛放行** | 只转 80 个 token-block Linear；32 台单独 7.90 天、全 FP8 6.27 天 |
 
 编译缓存固定放到大容量持久盘，避免五张图写满系统 `/tmp`。实测旧 `/tmp/torchinductor_root` 累计达到 13 GiB 并触发 `ENOSPC`；清理后源码、数据和 checkpoint 均未受影响。缓存迁移到 `/mnt/data/users/wfz/torchinductor-cache-uv3`。机器有 184 CPU，torch 默认每 rank 32 个编译线程会形成 256 线程过度订阅；推荐设置 `TORCHINDUCTOR_COMPILE_THREADS=8`，总计 64 个编译线程。首次构建很慢，但稳态训练与后续实验复用同一缓存；冷启动不混入 step 30→40 的吞吐。
 
@@ -200,7 +226,7 @@ BS14/16 都是新的 batch 静态形状，五个文本桶也都需要生成新�
 | 5 | fused AdamW、减少或融合 grad-clip/optimizer 扫描 | **fused -0.27%；仅 warmup clip -0.09%** | 低到中 | 两项均无 wall-clock 收益；保持非 fused AdamW 和每步 clip |
 | 6 | MMDiT `max-autotune-no-cudagraphs` | **实测 +1.22%** | 低 | 长训练可选；五桶首次搜索约 71 分钟，普通 `max-autotune` 因隐含 CUDA Graph 不采用 |
 | 7 | Qwen FP8 推理 | **实测 +9.57%～+19.43%** | 中 | 三档 32 台为 8.68/8.37/7.96 天；短程 loss 正常，但真实特征 rel-L2 为 4.67%～12.14%，待长程质量放行 |
-| 8 | MMDiT FP8 训练 | 15%～30% | 中到高 | 潜在收益大，但需要 loss/收敛和数值稳定性验证 |
+| 8 | MMDiT FP8 训练 | **单独实测 +21.81%；全 FP8 组合 +53.55%** | 高 | 80 个 token-block Linear；50 step finite，全 FP8 32 台 6.27 天，仍需长程收敛验证 |
 | 9 | 文本 token resampler，将 1024 tokens 压缩到 128～256 | 20%～40% | 高 | 可显著缩短 16 个 single-stream block 的序列，但属于模型架构变化 |
 
 多机训练应让 MMDiT 使用节点内 8 卡 shard、节点间 replicate 的 HSDP mesh，避免每层参数 all-gather 跨机器；该项主要改善多机扩展效率，不改变单机结果。

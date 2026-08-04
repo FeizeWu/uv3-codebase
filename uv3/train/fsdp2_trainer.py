@@ -330,6 +330,39 @@ def _maybe_quantize_text_encoder_fp8(qwen, cfg, rank):
         )
 
 
+def _maybe_convert_mmdit_fp8(mmdit, cfg, rank):
+    """Convert only token-level block Linear layers to trainable FP8.
+
+    Timestep and norm-modulation Linear layers operate on the raw batch axis.
+    With BS=12 their backward GEMMs violate scaled-mm's multiple-of-16
+    constraint, and they are too small to benefit from FP8 anyway.
+    """
+    if not bool(getattr(cfg.train, "mmdit_fp8", False)):
+        return
+    from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+
+    def token_block_linear(module, fqn):
+        qualified = f".{fqn}."
+        return isinstance(module, nn.Linear) and (
+            ".transformer_blocks." in qualified
+            or ".single_transformer_blocks." in qualified
+        )
+
+    convert_to_float8_training(
+        mmdit,
+        module_filter_fn=token_block_linear,
+        config=Float8LinearConfig(),
+    )
+    if rank == 0:
+        converted = sum(
+            type(module).__name__ == "Float8Linear" for module in mmdit.modules()
+        )
+        print(
+            f"[train] MMDiT FP8 ON: token-block Linear layers={converted}",
+            flush=True,
+        )
+
+
 def train(cfg: ExperimentConfig):
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if distributed:
@@ -344,6 +377,7 @@ def train(cfg: ExperimentConfig):
 
     vae, qwen, mmdit = build(cfg, dev, dtype)
     _maybe_quantize_text_encoder_fp8(qwen, cfg, rank)
+    _maybe_convert_mmdit_fp8(mmdit, cfg, rank)
 
     # Build the EMA teacher before FSDP so student and teacher can be sharded with
     # identical module boundaries and DTensor placements.  This lets EMA update
