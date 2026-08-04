@@ -220,6 +220,7 @@ torchao 的 `enable_fsdp_float8_all_gather` 先通过 2 卡缩小模型验证：
 | E | Qwen FP8 推理 | **中间 MLP +9.57%；全 MLP +13.57%；全量 +19.43%** | **完成性能/短程测试；待长程质量放行** | 三档 32 台为 8.68/8.37/7.96 天；优先验证中间 24 层 |
 | F | MMDiT FP8 训练 | **单独 +21.81%；叠加后最高 +53.55%** | **完成性能/短程测试；待长程收敛放行** | 只转 80 个 token-block Linear；32 台单独 7.90 天、全 FP8 6.27 天 |
 | G | FP8 权重 FSDP all-gather | packed scale -3.45%；**逐层 scale -0.11%** | **完成；仅作省显存开关** | no-precompute 省 2.17 GiB 且吞吐基本持平；32 台稳态 6.28 天 |
+| H | 节点内 8 卡 shard、节点间 replicate 的 HSDP | 单机不变；改善多机扩展 | **实现并通过 2D mesh 烟测；待真实多机测速** | `num_shard: 8` 在 256 卡自动生成 `(replicate=32, shard=8)` |
 
 编译缓存不能放系统 `/tmp`：实测旧 `/tmp/torchinductor_root` 累计达到 13 GiB 并触发 `ENOSPC`；清理后源码、数据和 checkpoint 均未受影响。持久缓存曾迁移到 `/mnt/data/users/wfz/torchinductor-cache-uv3`，但该 CPFS 当前 95% 满，首次新图编译时大量 worker 进入 `D` 状态等待 I/O。相同 FP8 all-gather 新图改用 `/dev/shm/uv3-inductor-fp8-ag` 后，冷启动完整 50 step 只用 11 分 18.7 秒；共享盘版本运行 4 分钟仍未完成 step 0，而此前普通 MMDiT FP8 在共享盘首次到 step 10 约 20.5 分钟。本地缓存最终约 8.5 GiB、20.25 万文件。单机实验推荐 `/dev/shm`；多机正式训练应先生成一次缓存，再在每个节点本地 staging，避免所有节点直接随机读写 CPFS。机器有 184 CPU，torch 默认每 rank 32 个编译线程会形成 256 线程过度订阅；推荐设置 `TORCHINDUCTOR_COMPILE_THREADS=8`，总计 64 个编译线程。冷启动不混入 step 30→40 的吞吐。
 
@@ -240,6 +241,7 @@ BS14/16 都是新的 batch 静态形状，五个文本桶也都需要生成新�
 | 7 | Qwen FP8 推理 | **实测 +9.57%～+19.43%** | 中 | 三档 32 台为 8.68/8.37/7.96 天；短程 loss 正常，但真实特征 rel-L2 为 4.67%～12.14%，待长程质量放行 |
 | 8 | MMDiT FP8 训练 | **单独实测 +21.81%；全 FP8 组合 +53.55%** | 高 | 80 个 token-block Linear；50 step finite，全 FP8 32 台 6.27 天，仍需长程收敛验证 |
 | 9 | FP8 FSDP all-gather | packed scale -3.45%；**no-precompute -0.11%** | 中 | 默认关闭；缺约 2 GiB 时可用 no-precompute，不能启用集中 scale 同步 |
-| 10 | 文本 token resampler，将 1024 tokens 压缩到 128～256 | 20%～40% | 高 | 可显著缩短 16 个 single-stream block 的序列，但属于模型架构变化 |
+| 10 | 节点内 FSDP + 节点间 DP 的 HSDP | 单机 0%；多机待测 | 低 | 已实现 `num_shard: 8`，2 卡真实 2D HSDP 前反向 finite；需要 2/4 台测扩展效率 |
+| 11 | 文本 token resampler，将 1024 tokens 压缩到 128～256 | 20%～40% | 高 | 可显著缩短 16 个 single-stream block 的序列，但属于模型架构变化 |
 
-多机训练应让 MMDiT 使用节点内 8 卡 shard、节点间 replicate 的 HSDP mesh，避免每层参数 all-gather 跨机器；该项主要改善多机扩展效率，不改变单机结果。
+多机 HSDP 配置已闭环：此前 `TrainConfig.num_shard` 虽然存在，但 trainer 没有把它传给 `make_mesh`，直接用当前 `num_replicate: 1` 扩到 256 卡会错误地产生跨全部机器的 FULL_SHARD。现在 `num_shard: 8` 在 8/16/256 卡分别解析为 `(8,)`、`(2,8)`、`(32,8)`；最优 BF16、全 FP8、中间 Qwen FP8 和 max-autotune 配置均已设置。2 卡缩小模型用 `(2,1)` 真实运行 compile + Flex + FP8 FSDP 连续 3 步 finite。这样每层参数 all-gather 只发生在本机 8 卡，节点间只同步每卡持有的 1/8 梯度 shard。上表 2～32 台时间仍是基于 99%～95% 效率的估算，真实效率必须用至少 2/4 台测速校准。

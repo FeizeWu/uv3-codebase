@@ -13,13 +13,60 @@ from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 
 
-def make_mesh(device_type: str = "cuda", num_replicate: int = 1, world_size: int | None = None):
+def resolve_mesh_shape(
+    world_size: int,
+    num_replicate: int = 1,
+    num_shard: int | None = None,
+) -> tuple[int, ...]:
+    """Resolve a 1D FSDP or 2D HSDP mesh without initializing distributed state.
+
+    ``num_shard`` takes precedence so an 8-GPU-node config stays node-local as
+    world size grows: world=256, num_shard=8 -> (replicate=32, shard=8).
+    ``num_replicate`` remains supported for older configs.
+    """
+    world_size = int(world_size)
+    num_replicate = int(num_replicate)
+    if world_size < 1 or num_replicate < 1:
+        raise ValueError("world_size and num_replicate must be positive")
+    if num_shard is not None:
+        num_shard = int(num_shard)
+        if num_shard < 1 or world_size % num_shard:
+            raise ValueError(
+                f"WORLD_SIZE={world_size} must be divisible by num_shard={num_shard}"
+            )
+        resolved_replicate = world_size // num_shard
+        if num_replicate not in (1, resolved_replicate):
+            raise ValueError(
+                f"conflicting mesh: num_replicate={num_replicate}, "
+                f"num_shard={num_shard}, WORLD_SIZE={world_size}"
+            )
+        num_replicate = resolved_replicate
+    else:
+        if world_size % num_replicate:
+            raise ValueError(
+                f"WORLD_SIZE={world_size} must be divisible by "
+                f"num_replicate={num_replicate}"
+            )
+        num_shard = world_size // num_replicate
+    return (world_size,) if num_replicate == 1 else (num_replicate, num_shard)
+
+
+def make_mesh(
+    device_type: str = "cuda",
+    num_replicate: int = 1,
+    num_shard: int | None = None,
+    world_size: int | None = None,
+):
     if world_size is None:
         world_size = torch.distributed.get_world_size()
-    num_shard = max(1, world_size // num_replicate)
-    if num_replicate == 1:
-        return init_device_mesh(device_type, (world_size,), mesh_dim_names=("shard",))
-    return init_device_mesh(device_type, (num_replicate, num_shard), mesh_dim_names=("replicate", "shard"))
+    mesh_shape = resolve_mesh_shape(world_size, num_replicate, num_shard)
+    if len(mesh_shape) == 1:
+        return init_device_mesh(device_type, mesh_shape, mesh_dim_names=("shard",))
+    return init_device_mesh(
+        device_type,
+        mesh_shape,
+        mesh_dim_names=("replicate", "shard"),
+    )
 
 
 def make_node_local_mesh(device_type: str = "cuda", shard_size: int | None = None):

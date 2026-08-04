@@ -439,7 +439,16 @@ def train(cfg: ExperimentConfig):
 
     mesh = None
     if distributed and cfg.train.fsdp2:
-        mesh = make_mesh(num_replicate=cfg.train.num_replicate)
+        mesh = make_mesh(
+            num_replicate=cfg.train.num_replicate,
+            num_shard=cfg.train.num_shard,
+        )
+        if rank == 0:
+            print(
+                f"[train] MMDiT FSDP2 mesh shape={tuple(mesh.shape)} "
+                f"dims={mesh.mesh_dim_names}",
+                flush=True,
+            )
         if bool(getattr(cfg.train, "fsdp_text_encoder", False)):
             qwen_mesh = make_node_local_mesh(
                 shard_size=int(getattr(cfg.train, "text_encoder_shard_size", 8))

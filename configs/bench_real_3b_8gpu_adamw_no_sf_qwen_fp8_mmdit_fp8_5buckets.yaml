@@ -25,6 +25,7 @@ train:
   fsdp2: true
   fsdp_text_encoder: false
   num_replicate: 1
+  num_shard: 8
   reshard_after_forward: false
   mixed_precision: bf16
   compile: true

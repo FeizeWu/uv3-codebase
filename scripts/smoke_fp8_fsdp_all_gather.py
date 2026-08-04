@@ -63,7 +63,11 @@ def main() -> None:
         config=Float8LinearConfig(enable_fsdp_float8_all_gather=True),
     )
     model.compile(dynamic=False, mode="default")
-    apply_fsdp2(model, make_mesh(), reshard_after_forward=False)
+    smoke_num_shard = os.environ.get("UV3_SMOKE_NUM_SHARD")
+    mesh = make_mesh(
+        num_shard=int(smoke_num_shard) if smoke_num_shard is not None else None
+    )
+    apply_fsdp2(model, mesh, reshard_after_forward=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     generator = torch.Generator(device).manual_seed(1234 + rank)

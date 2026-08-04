@@ -73,7 +73,10 @@ def main():
 
     mesh = None
     if distributed:
-        mesh = make_mesh(num_replicate=cfg.train.num_replicate)
+        mesh = make_mesh(
+            num_replicate=cfg.train.num_replicate,
+            num_shard=cfg.train.num_shard,
+        )
         apply_fsdp2(mmdit, mesh, reshard_after_forward=cfg.train.reshard_after_forward)
 
     optimizers, (n_m, n_a) = build_optimizers(mmdit, cfg)
