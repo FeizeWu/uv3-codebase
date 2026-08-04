@@ -26,7 +26,7 @@
 
 ## 运行
 ```bash
-# 服务器 ssh root@47.93.14.206 -p 1023
+# 登录训练服务器后，在远端 codebase 目录运行
 cd /mnt/data/users/wfz/uv3-codebase && export PYTHONPATH=.
 # 模型冒烟(t2i+it2i)
 CUDA_VISIBLE_DEVICES=5 python scripts/smoke_model.py

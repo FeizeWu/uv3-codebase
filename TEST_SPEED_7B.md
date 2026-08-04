@@ -60,3 +60,42 @@ BS6 的 MMDiT `max-autotune-no-cudagraphs` 再提升 1.26%，与 3B 的 +1.22% �
 当前 32 台推荐稳态估算为 17.93 天；加上 28 分 26 秒冷启动约为 **17.95 天**，仍基于 95% 扩展效率。真实 2/4 台 HSDP 效率需要多机测速校准。7B 的 FSDP/no-reshard 与 batch 收益高于 3B，但 7.3B MMDiT 的计算量也显著更大，因此仅靠这些等价优化不足以把 1B 样本压到 10 天以内。
 
 相对旧 Muon+self-flow、固定 1024 的 8.31 样本/秒，新 BF16 推荐组合达到 21.23 样本/秒，吞吐约为 **2.56 倍**；32 台估算从 45.83 天降到 17.93 天，缩短约 **60.9%**。
+
+## FLUX.2 Klein 4B 纯单流参数量实验
+
+本节参考 [FLUX.2 Klein 4B 官方 Transformer 配置](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B/blob/main/transformer/config.json)，固定 `hidden_size=3072`、24 heads、head dim 128、MLP ratio 3、图像输入维度 128、四轴 RoPE `(32,32,32,32)`，只改变 double/single block 的组合。参数量使用项目当前 `Flux2Transformer2DModel` 在 meta device 上精确计数；本节目前是参数量实验，尚不是速度实测结果。
+
+官方 Klein 4B 使用 5 个 double-stream block 和 20 个 single-stream block。一个 double block 为 245,367,296 参数，一个 single block 为 122,683,648 参数，因此一个 double block 的参数量恰好等于两个 single block；将 5 double + 20 single 改为 30 single，可以保持 Transformer 总参数量完全一致。
+
+| 架构 | Double blocks | Single blocks | 顺序深度 | Transformer 参数量 | 相对当前 7.294B |
+|---|---:|---:|---:|---:|---:|
+| 官方 Klein 4B | 5 | 20 | 25 | 3,875,544,576（3.8755B） | -46.86% |
+| 纯单流、保持顺序深度 | 0 | 25 | 25 | 3,262,126,336（3.2621B） | **-55.27%** |
+| 纯单流、保持 Klein 参数量 | 0 | 30 | 30 | 3,875,544,576（3.8755B） | -46.86% |
+| 纯单流、接近整 4B | 0 | 31 | 31 | 3,998,228,224（3.9982B） | -45.18% |
+
+以上采用官方 Klein 的 `joint_attention_dim=7680`。Klein 将一次 Qwen3 forward 的第 9、18、27 层 hidden state 拼接，得到 `3 × 2560 = 7680` 维文本条件。若暂时保持当前单层 Qwen 输出、使用 `joint_attention_dim=2560`，参数量如下：
+
+| 纯单流层数 | `joint_attention_dim=7680` | `joint_attention_dim=2560` | 差值 |
+|---:|---:|---:|---:|
+| 25 | 3.2621B | 3.2464B | -15.73M |
+| 30 | 3.8755B | 3.8598B | -15.73M |
+| 31 | 3.9982B | 3.9825B | -15.73M |
+
+第一轮速度实验优先选择 **0 double + 25 single**：它保持 Klein 的 25 层顺序深度，同时将 MMDiT 降到约 3.26B。30-single 版本虽然与官方 Klein 参数量相同，但顺序深度从 25 增加到 30；double block 的两套参数分别作用于文本和图像 token，而 single block 作用于拼接后的全部 token，因此“参数量相同”不等于“计算量相同”，30-single 预计会比原版 Klein 更慢。
+
+建议速度实验配置：
+
+```yaml
+model:
+  hidden_size: 3072
+  num_heads: 24
+  num_layers: 0
+  num_double_layers: 0
+  num_single_layers: 25
+  latent_channels: 32
+  rope_theta: 2000
+  guidance_embeds: false
+```
+
+若要严格复刻 Klein 的文本条件，还需要把当前 text encoder 从单层 2560 维输出改成第 9、18、27 层拼接的 7680 维输出；这只增加约 15.73M Transformer 参数，不需要把 Qwen 重复运行三次。
