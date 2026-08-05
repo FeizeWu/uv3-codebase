@@ -27,8 +27,8 @@ class ComponentConfig:
 class SelfFlowConfig:
     enabled: bool = True
     coeff: float = 1.0                     # projection-loss weight
-    teacher_depth: int = -1               # EMA teacher block index (-1 = last)
-    student_depth: int = -1              # student block index (-1 = first)
+    teacher_depth: int = -1               # teacher single-block index (-1 = last)
+    student_depth: int = -1               # first available stream index (-1 = first)
     timestep_mode: str = "ratio"          # ratio | random_cleaner | min
     ratio: float = 0.5                    # paired_t = t * ratio (for ratio mode)
     mask_ratio: float = 0.5               # per-token timestep masking probability
@@ -157,9 +157,21 @@ class TrainConfig:
     run_name: str = "run"
     wandb: bool = False
     wandb_project: str = "uv3"
+    monitor_enabled: bool = False
+    monitor_display_name: str | None = None
     profile: bool = False
     log_every: int = 10
     seed: int = 42
+    # Flow convention is always t=0 clean, t=1 noise. Sampling never flips t.
+    timestep_strategy: str = "logit_normal"  # uniform | logit_normal | logit_normal_shift
+    timestep_logit_mean: float = 0.0
+    timestep_logit_std: float = 1.0
+    timestep_shift: float | None = None       # None => dynamic shift for *_shift
+    timestep_base_seq_len: int = 256
+    timestep_max_seq_len: int = 8192
+    timestep_base_shift: float = 0.5
+    timestep_max_shift: float = 0.9
+    timestep_metrics: bool = False            # 10-bin distributed online statistics
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
 

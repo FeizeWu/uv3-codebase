@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import random
+from collections import OrderedDict
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -25,6 +26,21 @@ from .transforms import center_crop_resize
 MANIFEST_PATH = "/mnt/oss/uv3-pretrain-manifect/0803-test/manifect.jsonl"
 CAPTION_FIELD = "caption_qwen3_7_flash"
 META_COLS = ["shard_key", "filename", "offset", "size", "width", "height", "format", CAPTION_FIELD]
+
+
+def partition_shard_indices(
+    entry_count: int,
+    resume_shard: int,
+    shuffle: bool,
+    epoch: int,
+    worker_index: int,
+    total_workers: int,
+) -> list[int]:
+    """Return one worker's disjoint slice of a shared deterministic order."""
+    shard_indices = list(range(resume_shard, entry_count))
+    if shuffle and resume_shard == 0:
+        random.Random(1234 + epoch).shuffle(shard_indices)
+    return shard_indices[worker_index::total_workers]
 
 
 def _load_manifest(manifest_path: str):
@@ -66,25 +82,30 @@ class TarMetadataDataset(IterableDataset):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             rank, world = torch.distributed.get_rank(), torch.distributed.get_world_size()
         wid = rank * nworkers + wid
-        rng = random.Random(1234 + self._epoch + wid)
+        total_workers = world * nworkers
 
-        # shard order: inter-shard shuffle (skipping resumed shards)
-        shard_indices = list(range(self._resume_shard, len(self._entries)))
-        if self.shuffle and self._resume_shard == 0:
-            shard_indices = list(range(len(self._entries)))
-            rng.shuffle(shard_indices)
-        # partition across workers
-        shard_indices = shard_indices[wid::(world * nworkers)]
+        # Every worker must permute shards identically *before* strided
+        # partitioning.  A worker-specific permutation causes overlaps and
+        # omissions across ranks even though the slice strides are disjoint.
+        shard_indices = partition_shard_indices(
+            len(self._entries), self._resume_shard, self.shuffle,
+            self._epoch, wid, total_workers,
+        )
+        # Row-group order may differ per worker after shard ownership is fixed.
+        worker_rng = random.Random(5678 + self._epoch * total_workers + wid)
 
-        # cache tar file handles by path
-        tar_cache = {}
+        # Bound open files well below the common RLIMIT_NOFILE=1024.  The
+        # manifest contains tens of thousands of tar paths, so an unbounded
+        # cache eventually makes all later reads fail with EMFILE.
+        tar_cache = OrderedDict()
+        max_open_tars = 64
 
         for si_local, si_global in enumerate(shard_indices):
             image_tar, metadata_parquet = self._entries[si_global]
             pf = pq.ParquetFile(metadata_parquet)
             row_groups = list(range(pf.num_row_groups))
             if self.shuffle:
-                rng.shuffle(row_groups)
+                worker_rng.shuffle(row_groups)
 
             for rg in row_groups:
                 try:
@@ -108,7 +129,12 @@ class TarMetadataDataset(IterableDataset):
                     # read image from tar (byte-range via seek)
                     try:
                         if image_tar not in tar_cache:
+                            if len(tar_cache) >= max_open_tars:
+                                _, old_handle = tar_cache.popitem(last=False)
+                                old_handle.close()
                             tar_cache[image_tar] = open(image_tar, "rb")
+                        else:
+                            tar_cache.move_to_end(image_tar)
                         fh = tar_cache[image_tar]
                         fh.seek(row["offset"])
                         raw = fh.read(row["size"])

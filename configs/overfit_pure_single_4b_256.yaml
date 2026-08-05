@@ -1,0 +1,76 @@
+model:
+  architecture: mmdit
+  hidden_size: 3072
+  num_layers: 0
+  num_double_layers: 0
+  num_single_layers: 30
+  num_heads: 24
+  latent_channels: 32
+  patch_size: 2
+  rope_theta: 2000.0
+  guidance_embeds: false
+  flex_attention: true
+  alpha_on: false
+  vae: {backend: diffusers, pretrained: /mnt/data/share/checkpoints/black-forest-labs/FLUX.2-dev, subfolder: vae, trainable: false}
+  qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-9B, trainable: false, max_length: 1024}
+  transformer: {backend: random, trainable: true}
+  self_flow:
+    enabled: true
+    coeff: 1.0
+    ema_decay: 0.9999
+    student_depth: 0
+    teacher_depth: -1
+    mask_ratio: 0.5
+    ratio: 0.5
+    timestep_mode: ratio
+data:
+  dataset: fixed_tar
+  root: /mnt/oss/uv3-pretrain-manifect/0803-test/eval-v1/overfit/overfit_8.jsonl
+  image_size: 256
+  caption_field: caption_qwen3_7_flash
+  num_workers: 4
+train:
+  fsdp2: true
+  fsdp_text_encoder: false
+  num_replicate: 1
+  num_shard: 8
+  reshard_after_forward: false
+  mixed_precision: bf16
+  compile: true
+  compile_text_encoder: true
+  text_encoder_compile_mode: default
+  compile_vae: true
+  vae_compile_mode: max-autotune
+  compile_dynamic: false
+  compile_mode: default
+  text_length_buckets: [512, 640, 768, 896, 1024]
+  # Exact empirical counts for this fixed 8-caption set. Matching the source
+  # distribution prevents any bucket queue from growing across repeated epochs.
+  text_length_bucket_weights: [2, 1, 2, 1, 2]
+  pad_text_to_max_length: false
+  flex_attention: true
+  block_size: 128
+  batch_size_per_gpu: 13
+  grad_accum: 1
+  max_steps: 20000
+  grad_clip: 1.0
+  # Supervisor ends each 1k-step segment and the trainer's final save writes ckpt.pt.
+  ckpt_every: 100000
+  output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
+  run_name: overfit_pure_single_4b_8_20k_20260805
+  monitor_enabled: true
+  monitor_display_name: overfit-8
+  wandb: false
+  log_every: 10
+  seed: 42
+  timestep_strategy: logit_normal
+  timestep_logit_mean: 0.0
+  timestep_logit_std: 1.0
+  timestep_metrics: true
+  optimizer:
+    optimizer: adamw
+    adam_lr: 1.0e-4
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    adam_weight_decay: 0.0
+    adam_fused: false

@@ -1,0 +1,22 @@
+evaluation:
+  # The optimized student is the deliverable model. Self-Flow EMA is a
+  # training target and is evaluated only in explicitly named auxiliary runs.
+  weights: student
+  interval_steps: 1000
+  enabled_after_step: 1000
+  async_when_gpu_available: true
+  sample_steps: 30
+  image_size: 256
+  fixed_cases_manifest: /mnt/oss/uv3-pretrain-manifect/0803-test/eval-v1/fixed_cases_v2.jsonl
+  holdout_manifest: /mnt/oss/uv3-pretrain-manifect/0803-test/eval-v1/holdout_manifest.jsonl
+  fixed_cases:
+    train: 16
+    heldout: 16
+  distribution_metrics:
+    num_generated: 10000
+    metrics: [fid, kid, clipscore]
+    batch_size_per_gpu: 13
+    clip_model_path: /mnt/data/share/checkpoints/openai-mirror/clip-vit-base-patch32
+  schedule_later:
+    interval_steps: 2000
+    note: Increase further after curves become smooth; no code change required.

@@ -7,6 +7,8 @@ supported but empirically correct on torch 2.12). ckpt via checkpoint.state_dict
 from __future__ import annotations
 
 import os
+import shutil
+from pathlib import Path
 
 import torch
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
@@ -178,7 +180,7 @@ def apply_fsdp2(
     return model
 
 
-def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None):
+def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None, extra_models=None):
     """Save model + optimizer + RNG + data_status. Works in dist (rank0+barrier) and single modes."""
     from torch.distributed.checkpoint.state_dict import (
         get_model_state_dict, get_optimizer_state_dict, StateDictOptions,
@@ -186,6 +188,10 @@ def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None):
     opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
     msd = get_model_state_dict(model, options=opts)
     osd = {k: get_optimizer_state_dict(model, o, options=opts) for k, o in optimizers.items()}
+    extra_model_states = {
+        name: get_model_state_dict(extra_model, options=opts)
+        for name, extra_model in (extra_models or {}).items()
+    }
     rng_state = {"py": torch.get_rng_state()}
     if torch.cuda.is_available():
         rng_state["cuda"] = torch.cuda.get_rng_state()
@@ -193,21 +199,83 @@ def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None):
         rng_state["py_gen"] = rng.get_state()
     dist_ok = torch.distributed.is_available() and torch.distributed.is_initialized()
     rank0 = (not dist_ok) or torch.distributed.get_rank() == 0
+    if dist_ok:
+        rng_by_rank = [None] * torch.distributed.get_world_size() if rank0 else None
+        torch.distributed.gather_object(rng_state, rng_by_rank, dst=0)
+    else:
+        rng_by_rank = [rng_state]
     if rank0:
-        torch.save({"model": msd, "optim": osd, "step": getattr(model, "_step", 0),
-                    "rng": rng_state, "data_status": data_status}, path)
+        payload = {"model": msd, "optim": osd, "step": getattr(model, "_step", 0),
+                   "rng": rng_state, "rng_by_rank": rng_by_rank,
+                   "data_status": data_status,
+                   "extra_models": extra_model_states}
+        target = Path(path)
+        staging_root = Path(os.environ.get(
+            "UV3_CKPT_STAGING_DIR", "/mnt/data/users/wfz/uv3-checkpoint-staging"
+        )) / target.parent.name
+        staging_root.mkdir(parents=True, exist_ok=True)
+        local_stage = staging_root / f"{target.name}.staged"
+        remote_stage = target.with_name(f".{target.name}.staged")
+        # Never overwrite the last good OSS checkpoint while serialization is
+        # in progress. A SIGBUS/OSS write failure leaves either the old target
+        # or a complete local recovery copy, not a truncated ckpt.pt.
+        torch.save(payload, local_stage)
+        staged = torch.load(local_stage, map_location="cpu", mmap=True, weights_only=False)
+        if int(staged.get("step", -1)) != int(payload["step"]):
+            raise RuntimeError(f"local checkpoint validation failed: {local_stage}")
+        shutil.copyfile(local_stage, remote_stage)
+        if remote_stage.stat().st_size != local_stage.stat().st_size:
+            raise RuntimeError(f"OSS checkpoint size mismatch: {remote_stage}")
+        remote = torch.load(remote_stage, map_location="cpu", mmap=True, weights_only=False)
+        if int(remote.get("step", -1)) != int(payload["step"]):
+            raise RuntimeError(f"OSS checkpoint validation failed: {remote_stage}")
+        os.replace(remote_stage, target)
+        local_stage.unlink()
     if dist_ok:
         torch.distributed.barrier()
 
 
-def load_ckpt(model, optimizers: dict, path: str):
+def load_ckpt(model, optimizers: dict, path: str, extra_models=None, return_payload=False):
     from torch.distributed.checkpoint.state_dict import (
         set_model_state_dict, set_optimizer_state_dict, StateDictOptions,
     )
-    opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-    ckpt = torch.load(path, map_location="cpu")
-    set_model_state_dict(model, ckpt["model"], options=opts)
+    dist_ok = torch.distributed.is_available() and torch.distributed.is_initialized()
+    rank0 = (not dist_ok) or torch.distributed.get_rank() == 0
+    ckpt = (
+        torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+        if rank0 else {}
+    )
+    opts = StateDictOptions(
+        full_state_dict=True,
+        cpu_offload=True,
+        broadcast_from_rank0=dist_ok,
+    )
+    set_model_state_dict(model, ckpt.get("model", {}), options=opts)
+    saved_extra_models = ckpt.get("extra_models", {}) if rank0 else {}
+    for name, extra_model in (extra_models or {}).items():
+        if rank0 and name not in saved_extra_models:
+            raise KeyError(f"checkpoint is missing required extra model: {name}")
+        set_model_state_dict(extra_model, saved_extra_models.get(name, {}), options=opts)
     for k, o in optimizers.items():
-        if k in ckpt["optim"]:
-            set_optimizer_state_dict(model, o, ckpt["optim"][k], options=opts)
-    return ckpt.get("step", 0)
+        optimizer_state = ckpt.get("optim", {}).get(k, {}) if rank0 else {}
+        # Adam has no entry for trainable parameters that never received a
+        # gradient (for example dormant double-stream modules in a pure-single
+        # model). Their empty state is valid and will initialize on first use.
+        optimizer_opts = StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=True,
+            broadcast_from_rank0=dist_ok,
+            strict=False,
+        )
+        set_optimizer_state_dict(model, o, optimizer_state, options=optimizer_opts)
+    metadata = {
+        "step": int(ckpt.get("step", 0)) if rank0 else 0,
+        "rng": ckpt.get("rng") if rank0 else None,
+        "rng_by_rank": ckpt.get("rng_by_rank") if rank0 else None,
+        "data_status": ckpt.get("data_status") if rank0 else None,
+    }
+    if dist_ok:
+        objects = [metadata if rank0 else None]
+        torch.distributed.broadcast_object_list(objects, src=0)
+        metadata = objects[0]
+    return (metadata["step"], metadata) if return_payload else metadata["step"]

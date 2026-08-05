@@ -75,6 +75,59 @@ class FeatureCapture:
         self._handles = []
 
 
+def attach_self_flow_feature_captures(
+    student: nn.Module,
+    teacher: nn.Module,
+    student_depth: int = -1,
+    teacher_depth: int = -1,
+) -> tuple[FeatureCapture, FeatureCapture, bool]:
+    """Attach Self-Flow hooks for dual/single-stream and pure-single MMDiTs.
+
+    The default student target is the first available block, while the teacher
+    target is the last single-stream block. A pure-single student capture still
+    contains the leading text tokens, so the returned boolean tells the trainer
+    to remove that prefix before applying the projector/loss.
+    """
+    student_double = list(student.double_blocks)
+    student_single = list(student.single_blocks)
+    teacher_single = list(teacher.single_blocks)
+    if not teacher_single:
+        raise ValueError("Self-Flow requires at least one teacher single-stream block")
+
+    if student_double:
+        index = 0 if student_depth < 0 else student_depth
+        if not -len(student_double) <= index < len(student_double):
+            raise ValueError(
+                f"student_depth={student_depth} is out of range for "
+                f"{len(student_double)} double-stream blocks"
+            )
+        student_capture = FeatureCapture(stream="img_double")
+        student_capture.attach(student_double[index])
+        student_has_text_prefix = False
+    else:
+        if not student_single:
+            raise ValueError("Self-Flow requires at least one student transformer block")
+        index = 0 if student_depth < 0 else student_depth
+        if not -len(student_single) <= index < len(student_single):
+            raise ValueError(
+                f"student_depth={student_depth} is out of range for "
+                f"{len(student_single)} single-stream blocks"
+            )
+        student_capture = FeatureCapture(stream="all")
+        student_capture.attach(student_single[index])
+        student_has_text_prefix = True
+
+    teacher_index = -1 if teacher_depth < 0 else teacher_depth
+    if not -len(teacher_single) <= teacher_index < len(teacher_single):
+        raise ValueError(
+            f"teacher_depth={teacher_depth} is out of range for "
+            f"{len(teacher_single)} single-stream blocks"
+        )
+    teacher_capture = FeatureCapture(stream="all")
+    teacher_capture.attach(teacher_single[teacher_index])
+    return student_capture, teacher_capture, student_has_text_prefix
+
+
 def build_self_flow_latents_continuous(
     clean: torch.Tensor, noise: torch.Tensor, t: torch.Tensor,
     mask_ratio: float = 0.5, ratio: float = 0.5, patch_size: int = 2,

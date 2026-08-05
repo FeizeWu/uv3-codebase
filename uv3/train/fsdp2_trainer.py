@@ -9,13 +9,16 @@ from __future__ import annotations
 import argparse
 import copy
 import itertools
+import json
 import os
 import random
 import time
+from dataclasses import asdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 from torch.utils.data import DataLoader
 
 from ..config import load_config, ExperimentConfig
@@ -23,8 +26,14 @@ from ..data.parquet_dataset import ParquetImageDataset
 from ..modeling.vae import Flux2VAE
 from ..modeling.qwen3_5 import Qwen3_5TextEncoder
 from ..modeling.mmdit import MMDiT
-from ..modeling.self_flow import build_self_flow_projector, self_flow_feature_loss, FeatureCapture, build_self_flow_latents_continuous
-from ..modeling.flow import interpolate, velocity_target, logit_normal_timesteps
+from ..modeling.self_flow import (
+    attach_self_flow_feature_captures,
+    build_self_flow_projector,
+    self_flow_feature_loss,
+    build_self_flow_latents_continuous,
+)
+from ..modeling.flow import interpolate, velocity_target
+from ..data.noise_scheduler import sample_timesteps, timestep_bin_sums
 from ..optim.build_optimizers import build_optimizers
 from .fsdp2 import (
     apply_fsdp2,
@@ -103,27 +112,40 @@ def _attention_mask(mmdit, text_valid, n_img, block_size, device):
     return additive
 
 
+def _reshard_fsdp2_modules_(model: nn.Module) -> None:
+    """Restore DTensor parameter views for every composable-FSDP unit."""
+    for module in model.modules():
+        reshard = getattr(module, "reshard", None)
+        if callable(reshard):
+            reshard()
+
+
 @torch.no_grad()
 def _ema_update_local_shards_(teacher: nn.Module, student: nn.Module, decay: float) -> None:
-    """Update an identically sharded FSDP2 teacher without materializing full params."""
-    teacher_params = tuple(teacher.parameters())
-    student_params = tuple(student.parameters())
-    if len(teacher_params) != len(student_params):
-        raise RuntimeError(
-            f"EMA teacher/student parameter count mismatch: "
-            f"{len(teacher_params)} != {len(student_params)}"
-        )
+    """Update identically sharded FSDP2 parameters without full materialization."""
+    _reshard_fsdp2_modules_(teacher)
+    _reshard_fsdp2_modules_(student)
+    teacher_params = dict(teacher.named_parameters())
+    student_params = dict(student.named_parameters())
+    if teacher_params.keys() != student_params.keys():
+        missing = sorted(teacher_params.keys() - student_params.keys())
+        extra = sorted(student_params.keys() - teacher_params.keys())
+        raise RuntimeError(f"EMA parameter names mismatch: missing={missing[:3]} extra={extra[:3]}")
     weight = 1.0 - decay
-    for index, (teacher_param, student_param) in enumerate(zip(teacher_params, student_params)):
+    for name, teacher_param in teacher_params.items():
+        student_param = student_params[name]
         teacher_local = getattr(teacher_param, "to_local", None)
         student_local = getattr(student_param, "to_local", None)
         if (teacher_local is None) != (student_local is None):
-            raise RuntimeError(f"EMA parameter {index} has mismatched sharding")
+            raise RuntimeError(
+                f"EMA parameter {name} has mismatched sharding: "
+                f"teacher={type(teacher_param).__name__} student={type(student_param).__name__}"
+            )
         dst = teacher_local() if teacher_local is not None else teacher_param
         src = student_local() if student_local is not None else student_param
         if dst.shape != src.shape:
             raise RuntimeError(
-                f"EMA local shard shape mismatch at parameter {index}: {dst.shape} != {src.shape}"
+                f"EMA local shard shape mismatch at {name}: {dst.shape} != {src.shape}"
             )
         dst.lerp_(src, weight)
 
@@ -377,11 +399,13 @@ def train(cfg: ExperimentConfig):
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if distributed:
         torch.distributed.init_process_group("nccl")
-        rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(rank)
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = torch.distributed.get_rank()
+        torch.cuda.set_device(local_rank)
     else:
+        local_rank = 0
         rank = 0
-    dev = torch.device("cuda", rank)
+    dev = torch.device("cuda", local_rank)
     dtype = torch.bfloat16
     torch.manual_seed(cfg.train.seed)
 
@@ -410,6 +434,7 @@ def train(cfg: ExperimentConfig):
     sf_cfg = getattr(cfg.model, "self_flow", None)
     sf_enabled = bool(getattr(sf_cfg, "enabled", False)) if sf_cfg else False
     teacher = projector = student_cap = teacher_cap = None
+    sf_student_has_text_prefix = False
     sf_coeff = 0.0
     sf_decay = 0.99
     sf_n_txt = 64
@@ -428,12 +453,21 @@ def train(cfg: ExperimentConfig):
         sf_mask_ratio = float(getattr(sf_cfg, "mask_ratio", 0.5))
         sf_ratio = float(getattr(sf_cfg, "ratio", 0.5))
         sf_timestep_mode = str(getattr(sf_cfg, "timestep_mode", "ratio"))
-        # student captures double[0] IMG stream; teacher captures single[-1] full output (slice img later)
-        student_cap = FeatureCapture(stream="img_double"); student_cap.attach(mmdit.double_blocks[0])
-        teacher_cap = FeatureCapture(stream="all"); teacher_cap.attach(teacher.single_blocks[-1])
+        student_cap, teacher_cap, sf_student_has_text_prefix = (
+            attach_self_flow_feature_captures(
+                mmdit,
+                teacher,
+                student_depth=int(getattr(sf_cfg, "student_depth", -1)),
+                teacher_depth=int(getattr(sf_cfg, "teacher_depth", -1)),
+            )
+        )
         if rank == 0:
             print(f"[train] self-flow enabled coeff={sf_coeff} ema_decay={sf_decay} "
                   f"mask_ratio={sf_mask_ratio} mode={sf_timestep_mode}", flush=True)
+
+    # Model/projector initialization must match on every rank, while training
+    # noise and timestep draws must not be identical across data-parallel ranks.
+    torch.manual_seed(cfg.train.seed + rank)
 
     _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank)
 
@@ -462,8 +496,9 @@ def train(cfg: ExperimentConfig):
                 )
         apply_fsdp2(mmdit, mesh, reshard_after_forward=cfg.train.reshard_after_forward)
         if sf_enabled:
-            if os.environ.get("UV3_BENCH_LEGACY_EMA") != "1":
-                apply_fsdp2(teacher, mesh, reshard_after_forward=cfg.train.reshard_after_forward)
+            # Teacher has no backward pass to trigger resharding.
+            # Always reshard after forward so shard-local EMA sees matching DTensors.
+            apply_fsdp2(teacher, mesh, reshard_after_forward=True)
             # shard the projector too so optimizer param groups are all-DTensor (avoid mixed foreach)
             from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
             mp = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
@@ -477,6 +512,24 @@ def train(cfg: ExperimentConfig):
     out_dir = os.path.join(cfg.train.output_dir, cfg.train.run_name)
     if rank == 0:
         os.makedirs(out_dir, exist_ok=True)
+        config_tmp = os.path.join(out_dir, "config.yaml.tmp")
+        with open(config_tmp, "w", encoding="utf-8") as config_file:
+            yaml.safe_dump(asdict(cfg), config_file, sort_keys=False, allow_unicode=True)
+        os.replace(config_tmp, os.path.join(out_dir, "config.yaml"))
+        if cfg.train.monitor_enabled:
+            run_tmp = os.path.join(out_dir, "run.json.tmp")
+            with open(run_tmp, "w", encoding="utf-8") as run_file:
+                json.dump(
+                    {
+                        "monitor_enabled": True,
+                        "display_name": cfg.train.monitor_display_name or cfg.train.run_name,
+                    },
+                    run_file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                run_file.write("\n")
+            os.replace(run_tmp, os.path.join(out_dir, "run.json"))
 
     # RNG generator (defined BEFORE resume block so restore can reference it)
     g = torch.Generator(dev).manual_seed(123)
@@ -487,20 +540,36 @@ def train(cfg: ExperimentConfig):
     resumed_epoch = 0
     if os.path.exists(ckpt_path):
         try:
-            start_step = load_ckpt(opt_model, optimizers, ckpt_path)
-            ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            if "rng" in ck:
-                torch.set_rng_state(ck["rng"]["py"])
-                if torch.cuda.is_available() and "cuda" in ck["rng"]:
-                    torch.cuda.set_rng_state(ck["rng"]["cuda"])
-                if "py_gen" in ck["rng"]:
-                    g.set_state(ck["rng"]["py_gen"])
-            resumed_epoch = ck.get("data_status", {}).get("epoch", 0)
+            start_step, resume_payload = load_ckpt(
+                opt_model, optimizers, ckpt_path,
+                extra_models={"self_flow_teacher": teacher} if sf_enabled else None,
+                return_payload=True,
+            )
+            ck = resume_payload
+            rank_rngs = ck.get("rng_by_rank")
+            restored_rng = (
+                rank_rngs[rank]
+                if rank_rngs is not None and rank < len(rank_rngs)
+                else ck.get("rng")
+            )
+            if restored_rng is not None:
+                torch.set_rng_state(restored_rng["py"])
+                if torch.cuda.is_available() and "cuda" in restored_rng:
+                    torch.cuda.set_rng_state(restored_rng["cuda"])
+                if "py_gen" in restored_rng:
+                    g.set_state(restored_rng["py_gen"])
+            resumed_epoch = ck.get("data_status", {}).get("epoch", 0) or 0
             if rank == 0:
                 print(f"[train] resumed from step {start_step} (epoch {resumed_epoch})", flush=True)
+                print(
+                    "[train] WARNING: model/optimizer/per-rank RNG are exact, but "
+                    "the multi-worker text-bucket data cursor restarts at the saved epoch",
+                    flush=True,
+                )
         except Exception as e:
             if rank == 0:
-                print(f"[train] resume failed ({type(e).__name__}: {e}); starting fresh", flush=True)
+                print(f"[train] resume failed ({type(e).__name__}: {e})", flush=True)
+            raise RuntimeError(f"refusing to start fresh after checkpoint load failure: {ckpt_path}") from e
 
     # data: TarMetadataDataset (real data) or ParquetImageDataset (imagenet smoke)
     if cfg.data.dataset == "tar":
@@ -511,8 +580,18 @@ def train(cfg: ExperimentConfig):
             caption_field=getattr(cfg.data, "caption_field", "caption_qwen3_7_flash"),
         )
         ds.set_epoch(resumed_epoch)
-        if resumed_epoch > 0 or hasattr(ds, "_resume_shard") and ds._resume_shard > 0:
-            ds.set_resume(resumed_epoch, 0)  # coarse: epoch-level resume
+    elif cfg.data.dataset == "fixed_tar":
+        from ..data.fixed_tar_dataset import FixedTarSampleDataset
+        # Small fixed sets are repeatedly buffered by text-length bucket. The
+        # default file_descriptor sharing consumes one FD per queued tensor;
+        # file_system keeps transient bucket buffering from exhausting RLIMIT.
+        torch.multiprocessing.set_sharing_strategy("file_system")
+        ds = FixedTarSampleDataset(
+            cases_path=cfg.data.root,
+            image_size=cfg.data.image_size,
+            shuffle=True,
+        )
+        ds.set_epoch(resumed_epoch)
     else:
         ds = ParquetImageDataset(
             root=cfg.data.root, split=cfg.data.split, parquet_glob=cfg.data.parquet_glob,
@@ -569,6 +648,31 @@ def train(cfg: ExperimentConfig):
     grad_norm_samples: list[float] = []
     measured_steps = 0
     bucket_counts = {}
+    timestep_metrics = bool(getattr(cfg.train, "timestep_metrics", False))
+    timestep_bin_counts = torch.zeros(10, device=dev, dtype=torch.float64)
+    timestep_bin_fm_sums = torch.zeros_like(timestep_bin_counts)
+    timestep_bin_sf_sums = torch.zeros_like(timestep_bin_counts)
+    profile_start = int(os.environ.get("UV3_PROFILE_START", "-1"))
+    profile_steps = int(os.environ.get("UV3_PROFILE_STEPS", "0"))
+    profile_totals: dict[str, float] = {}
+    profile_last = 0.0
+    profile_active = False
+
+    def profile_begin(current_step: int) -> None:
+        nonlocal profile_last, profile_active
+        profile_active = profile_steps > 0 and profile_start <= current_step < profile_start + profile_steps
+        if profile_active:
+            torch.cuda.synchronize()
+            profile_last = time.perf_counter()
+
+    def profile_mark(name: str) -> None:
+        nonlocal profile_last
+        if not profile_active:
+            return
+        torch.cuda.synchronize()
+        now = time.perf_counter()
+        profile_totals[name] = profile_totals.get(name, 0.0) + now - profile_last
+        profile_last = now
     for o in optimizers.values():
         o.zero_grad()
 
@@ -581,8 +685,10 @@ def train(cfg: ExperimentConfig):
             prefetcher = DataPrefetcher(loader, dev, dtype)
             batch = prefetcher.next()
         timer.start()
+        profile_begin(step)
         with torch.no_grad():
             latents = vae.encode_images(batch["pixel_values"])      # vae
+        profile_mark("vae")
         timer.mark("vae")
         text_attn_mask = None
         with torch.no_grad():
@@ -614,34 +720,69 @@ def train(cfg: ExperimentConfig):
             text_attn_mask = _attention_mask(
                 mmdit, mask, n_img, cfg.train.block_size, dev,
             )
+        profile_mark("qwen_and_mask")
         timer.mark("qwen")
+        t = sample_timesteps(
+            bs,
+            dev,
+            strategy=cfg.train.timestep_strategy,
+            image_seq_len=n_img,
+            shift=cfg.train.timestep_shift,
+            logit_mean=cfg.train.timestep_logit_mean,
+            logit_std=cfg.train.timestep_logit_std,
+            base_seq_len=cfg.train.timestep_base_seq_len,
+            max_seq_len=cfg.train.timestep_max_seq_len,
+            base_shift=cfg.train.timestep_base_shift,
+            max_shift=cfg.train.timestep_max_shift,
+        )
+        noise = torch.randn_like(latents)
+        target_v = velocity_target(latents, noise).float()
+        sf_loss_per_sample = None
         if sf_enabled:
-            t = logit_normal_timesteps(bs, dev)
-            noise = torch.randn_like(latents)
             # per-token self-flow: mixed student latents + per-token timesteps
             student_latents, teach_lat, t_teach, token_t = build_self_flow_latents_continuous(
                 latents, noise, t,
                 mask_ratio=sf_mask_ratio, ratio=sf_ratio, timestep_mode=sf_timestep_mode,
             )
-            # student forward with per-token timestep modulation (captures double[0] img stream)
+            # Student capture is an image-only double stream, or a full
+            # [text, image] sequence when the architecture is pure-single.
             pred_v = mmdit(student_latents, text, t,
                            token_timesteps=token_t, text_attn_mask=text_attn_mask)
-            fm_loss = F.mse_loss(pred_v.float(), velocity_target(latents, noise).float())
+            fm_loss_per_sample = (pred_v.float() - target_v).square().flatten(1).mean(1)
+            fm_loss = fm_loss_per_sample.mean()
+            profile_mark("student_forward_and_fm_loss")
             with torch.no_grad():
                 _ = teacher(teach_lat, text, t_teach, text_attn_mask=text_attn_mask)
+            profile_mark("teacher_forward")
             s_feat = student_cap.features
             t_feat = teacher_cap.features
-            # teacher returns full [txt, img] sequence; slice img segment dynamically
             n_txt_actual = text.shape[1]
+            s_feat_img = s_feat[:, n_txt_actual:] if sf_student_has_text_prefix else s_feat
             t_feat_img = t_feat[:, n_txt_actual:]
-            n_tok = min(s_feat.shape[1], t_feat_img.shape[1])
-            proj_s = projector(s_feat[:, :n_tok])
-            feat_loss = self_flow_feature_loss(t_feat_img[:, :n_tok], proj_s)
+            n_tok = min(s_feat_img.shape[1], t_feat_img.shape[1])
+            proj_s = projector(s_feat_img[:, :n_tok])
+            teacher_norm = F.normalize(t_feat_img[:, :n_tok].float().detach(), dim=-1)
+            student_norm = F.normalize(proj_s.float(), dim=-1)
+            sf_loss_per_sample = 1.0 - (teacher_norm * student_norm).sum(dim=-1).mean(dim=-1)
+            feat_loss = sf_loss_per_sample.mean()
             loss = fm_loss + sf_coeff * feat_loss
+            profile_mark("feature_loss")
         else:
-            loss = mmdit.training_loss(latents, text, text_attn_mask=text_attn_mask)  # basic-FM forward
+            noisy = interpolate(latents, noise, t)
+            pred_v = mmdit(noisy, text, t, text_attn_mask=text_attn_mask)
+            fm_loss_per_sample = (pred_v.float() - target_v).square().flatten(1).mean(1)
+            loss = fm_loss_per_sample.mean()
+            profile_mark("student_forward_and_fm_loss")
+        if timestep_metrics:
+            bin_counts, bin_fm, bin_sf = timestep_bin_sums(
+                t, fm_loss_per_sample, sf_loss_per_sample,
+            )
+            timestep_bin_counts += bin_counts
+            timestep_bin_fm_sums += bin_fm
+            timestep_bin_sf_sums += bin_sf
         timer.mark("forward")
         (loss / accum).backward()                                     # backward
+        profile_mark("backward")
         timer.mark("backward")
         if (step + 1) % accum == 0:
             clip_warmup = max(0, cfg.train.grad_clip_warmup_steps)
@@ -665,27 +806,26 @@ def train(cfg: ExperimentConfig):
                         grad_norm_samples.append(grad_norm_value)
                 if projector is not None:
                     torch.nn.utils.clip_grad_norm_(projector.parameters(), cfg.train.grad_clip)
+            profile_mark("grad_clip")
             for o in optimizers.values():
                 o.step()                                             # optimizer
+            profile_mark("optimizer")
             if fp8_precompute_scale:
                 precompute_float8_dynamic_scale_for_fsdp(mmdit)
             for o in optimizers.values():
                 o.zero_grad()
+            profile_mark("zero_grad")
             # EMA matching local shards. Student and teacher use the same FSDP2
             # wrapping, so this is mathematically identical to full-parameter EMA
             # without a per-parameter all-gather or a replicated teacher.
             if sf_enabled:
-                if os.environ.get("UV3_BENCH_LEGACY_EMA") == "1":
-                    with torch.no_grad():
-                        for teacher_param, student_param in zip(teacher.parameters(), mmdit.parameters()):
-                            full_tensor = getattr(student_param, "full_tensor", None)
-                            teacher_param.lerp_(
-                                full_tensor() if full_tensor is not None else student_param,
-                                1 - sf_decay,
-                            )
-                else:
-                    _ema_update_local_shards_(teacher, mmdit, sf_decay)
+                _ema_update_local_shards_(teacher, mmdit, sf_decay)
+            profile_mark("ema_reshard_and_lerp")
         timer.mark("step")
+        if profile_steps > 0 and step + 1 == profile_start + profile_steps and rank == 0:
+            import json as _json
+            per_step = {key: value / profile_steps for key, value in profile_totals.items()}
+            print("[profile] " + _json.dumps({"steps": profile_steps, "seconds_per_step": per_step}, sort_keys=True), flush=True)
         if bench_warmup and step + 1 == start_step + bench_warmup:
             torch.cuda.synchronize()
             t0 = time.time()
@@ -697,6 +837,14 @@ def train(cfg: ExperimentConfig):
         elif step + 1 > start_step + bench_warmup:
             measured_steps += 1
         # 下方 ts 是自上次 log 起 log_every 步的累计秒数(timer.reset 在块尾),非每步值。
+        reduced_timestep_bins = None
+        if timestep_metrics and step % log_every == 0:
+            reduced = torch.stack(
+                [timestep_bin_counts, timestep_bin_fm_sums, timestep_bin_sf_sums]
+            )
+            if distributed:
+                torch.distributed.all_reduce(reduced)
+            reduced_timestep_bins = reduced.cpu()
         if rank == 0 and step % log_every == 0:
             spd = measured_steps / (time.time() - t0 + 1e-9) if measured_steps else 0.0
             ts = timer.summary()
@@ -706,6 +854,16 @@ def train(cfg: ExperimentConfig):
             bucket_str = f" buckets={dict(sorted(bucket_counts.items()))}" if text_buckets else ""
             grad_norm_stats = None
             grad_norm_str = ""
+            timestep_stats = None
+            if reduced_timestep_bins is not None:
+                counts, fm_sums, sf_sums = reduced_timestep_bins
+                safe_counts = counts.clamp_min(1.0)
+                timestep_stats = {
+                    "edges": [i / 10 for i in range(11)],
+                    "count": counts.to(torch.int64).tolist(),
+                    "fm_loss": (fm_sums / safe_counts).tolist(),
+                    "self_flow_loss": (sf_sums / safe_counts).tolist() if sf_enabled else None,
+                }
             if audit_grad_norm and grad_norm_samples:
                 grad_norm_stats = {
                     "min": min(grad_norm_samples),
@@ -727,23 +885,38 @@ def train(cfg: ExperimentConfig):
                             "max_memory_reserved_gib": mem_gib, "max_memory_reserved_pct": mem_pct,
                             "timing": ts, "timing_unit": f"sum_over_{log_every}_steps",
                             "text_bucket_counts": dict(sorted(bucket_counts.items())),
-                            "grad_norm": grad_norm_stats}, _jf)
+                            "grad_norm": grad_norm_stats,
+                            "timestep_bins": timestep_stats}, _jf)
                 _jf.write("\n")
             timer.reset()
             bucket_counts = {}
             grad_norm_samples = []
-        if cfg.train.ckpt_every < max_steps and step > 0 and step % cfg.train.ckpt_every == 0:
-            opt_model._step = step
-            save_ckpt(opt_model, optimizers, ckpt_path, rng=g,
-                      data_status={"epoch": step // 1000, "step": step})
+        if timestep_metrics and step % log_every == 0:
+            timestep_bin_counts.zero_()
+            timestep_bin_fm_sums.zero_()
+            timestep_bin_sf_sums.zero_()
+        completed_steps = step + 1
+        if (
+            cfg.train.ckpt_every < max_steps
+            and completed_steps % cfg.train.ckpt_every == 0
+        ):
+            opt_model._step = completed_steps
+            save_ckpt(
+                opt_model, optimizers, ckpt_path, rng=g,
+                data_status={"epoch": resumed_epoch, "step": completed_steps},
+                extra_models={"self_flow_teacher": teacher} if sf_enabled else None,
+            )
             if rank == 0:
-                print(f"[train] ckpt saved @ step {step}", flush=True)
+                print(f"[train] ckpt saved @ completed_step {completed_steps}", flush=True)
         step += 1
 
     if os.environ.get("UV3_BENCH_NO_CKPT") != "1":
         opt_model._step = step
-        save_ckpt(opt_model, optimizers, ckpt_path, rng=g,
-                  data_status={"epoch": step // 1000, "step": step})
+        save_ckpt(
+            opt_model, optimizers, ckpt_path, rng=g,
+            data_status={"epoch": resumed_epoch, "step": step},
+            extra_models={"self_flow_teacher": teacher} if sf_enabled else None,
+        )
     if rank == 0:
         lv = loss.item() if loss is not None else float("nan")
         print(f"[train] DONE step {step} loss={lv:.4f} ckpt {ckpt_path}", flush=True)
@@ -754,6 +927,18 @@ def main():
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
     cfg = load_config(args.config)
+    # Safe launch-time identity/length overrides keep benchmark and smoke runs
+    # isolated without generating near-duplicate YAML files.
+    if os.environ.get("UV3_RUN_NAME"):
+        cfg.train.run_name = os.environ["UV3_RUN_NAME"]
+    if os.environ.get("UV3_MAX_STEPS"):
+        cfg.train.max_steps = int(os.environ["UV3_MAX_STEPS"])
+    if os.environ.get("UV3_LOG_EVERY"):
+        cfg.train.log_every = int(os.environ["UV3_LOG_EVERY"])
+    if "UV3_MONITOR" in os.environ:
+        cfg.train.monitor_enabled = os.environ["UV3_MONITOR"] == "1"
+    if os.environ.get("UV3_MONITOR_NAME"):
+        cfg.train.monitor_display_name = os.environ["UV3_MONITOR_NAME"]
     train(cfg)
 
 

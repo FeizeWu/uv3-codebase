@@ -1,0 +1,15 @@
+evaluation:
+  weights: student
+  interval_steps: 1000
+  enabled_after_step: 1000
+  sample_steps: 30
+  image_size: 256
+  fixed_cases_manifest: /mnt/oss/uv3-pretrain-manifect/0803-test/eval-v1/overfit/overfit_8.jsonl
+  fixed_cases:
+    train: 8
+  distribution_metrics:
+    enabled: false
+    num_generated: 10000
+    metrics: [fid, kid, clipscore]
+    batch_size_per_gpu: 13
+    clip_model_path: /mnt/data/share/checkpoints/openai-mirror/clip-vit-base-patch32
