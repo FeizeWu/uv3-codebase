@@ -14,7 +14,7 @@ model:
   guidance_embeds: false
   flex_attention: true
   alpha_on: false
-  vae: {backend: diffusers, pretrained: /mnt/data/share/checkpoints/black-forest-labs/FLUX.2-dev, subfolder: vae, trainable: false}
+  vae: {backend: diffusers, pretrained: /mnt/data/users/wfz/checkpoints/black-forest-labs/FLUX.2-dev, subfolder: vae, trainable: false}
   qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-9B, trainable: false, max_length: 1024}
   transformer: {backend: random, trainable: true}
   self_flow:

@@ -87,7 +87,7 @@ for required_path in \
   "${PYTHON_BIN}" \
   "${CONFIG}" \
   "${MANIFEST}" \
-  "/mnt/data/share/checkpoints/black-forest-labs/FLUX.2-dev/vae" \
+  "/mnt/data/users/wfz/checkpoints/black-forest-labs/FLUX.2-dev/vae" \
   "/mnt/data/share/checkpoints/Qwen/Qwen3.5-9B"; do
   if [[ ! -e "${required_path}" ]]; then
     echo "[error] missing required path: ${required_path}" >&2
@@ -119,6 +119,9 @@ manifest = Path(os.environ["UV3_LAUNCH_MANIFEST"])
 errors = []
 if cfg.data.dataset != "tar": errors.append(f"data.dataset={cfg.data.dataset!r}")
 if Path(cfg.data.root) != manifest: errors.append(f"config data.root={cfg.data.root!r}")
+expected_vae = Path("/mnt/data/users/wfz/checkpoints/black-forest-labs/FLUX.2-dev")
+if Path(cfg.model.vae.pretrained) != expected_vae:
+    errors.append(f"config vae.pretrained={cfg.model.vae.pretrained!r}")
 if cfg.data.caption_field != "caption_qwen3_7_flash": errors.append(f"caption_field={cfg.data.caption_field!r}")
 if cfg.model.num_double_layers != 0 or cfg.model.num_single_layers != 30:
     errors.append(f"layers={cfg.model.num_double_layers}+{cfg.model.num_single_layers}")
