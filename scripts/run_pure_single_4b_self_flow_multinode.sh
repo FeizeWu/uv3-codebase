@@ -145,7 +145,7 @@ if [[ "${UV3_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-exec "${PYTHON_BIN}" -m torch.distributed.run \
+"${PYTHON_BIN}" -m torch.distributed.run \
   --nnodes="${NNODES}" \
   --nproc_per_node="${GPUS_PER_NODE}" \
   --node_rank="${NODE_RANK}" \
@@ -155,3 +155,31 @@ exec "${PYTHON_BIN}" -m torch.distributed.run \
   --tee 3 \
   -m uv3.train.fsdp2_trainer \
   --config "${CONFIG}"
+
+# torchrun returns only after every worker on every node has exited.  All four
+# training nodes are therefore clear before node rank 0 reuses its eight GPUs
+# for the final student evaluation.  Other nodes can leave the allocation.
+if [[ "${RUN_EVAL_AFTER_TRAIN:-1}" != "1" ]]; then
+  echo "[eval] RUN_EVAL_AFTER_TRAIN=${RUN_EVAL_AFTER_TRAIN:-0}; skipping"
+  exit 0
+fi
+if [[ "${UV3_BENCH_NO_CKPT:-0}" == "1" ]]; then
+  echo "[eval] UV3_BENCH_NO_CKPT=1; smoke run has no checkpoint, skipping"
+  exit 0
+fi
+if [[ "${NODE_RANK}" != "0" ]]; then
+  echo "[eval] node rank ${NODE_RANK} finished; final evaluation runs on node rank 0"
+  exit 0
+fi
+if [[ ! -f "${checkpoint}" ]]; then
+  echo "[error] training completed but final checkpoint is missing: ${checkpoint}" >&2
+  exit 1
+fi
+
+echo "[eval] training complete; starting final student evaluation on node rank 0"
+RUN_NAME="${RUN_NAME}" \
+RUN_DIR="${output_dir}" \
+CHECKPOINT="${checkpoint}" \
+EVAL_CONFIG="${EVAL_CONFIG:-${REPO_ROOT}/configs/eval_4b_test.yaml}" \
+MASTER_PORT="${EVAL_MASTER_PORT:-29685}" \
+"${REPO_ROOT}/scripts/run_eval_4b_8gpu.sh"
