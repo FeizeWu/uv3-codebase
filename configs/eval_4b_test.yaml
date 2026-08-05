@@ -15,7 +15,9 @@ evaluation:
   distribution_metrics:
     num_generated: 10000
     metrics: [fid, kid, clipscore]
-    batch_size_per_gpu: 13
+    # BS13 can OOM on an unusually long caption while FlexAttention builds its
+    # block mask. BS12 retains most throughput with several GiB of headroom.
+    batch_size_per_gpu: 12
     clip_model_path: /mnt/data/share/checkpoints/openai-mirror/clip-vit-base-patch32
   schedule_later:
     interval_steps: 2000

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import math
@@ -15,7 +16,6 @@ from PIL import Image
 
 from ..config import load_config
 from ..data.tar_dataset import TarMetadataDataset
-from ..data.transforms import center_crop_resize
 from ..modeling.flow import euler_schedule, euler_step
 from ..train.fsdp2 import apply_fsdp2, make_mesh
 from ..train.fsdp2_trainer import _attention_mask, build
@@ -30,6 +30,59 @@ def save_tensor_image(image: torch.Tensor, path: Path) -> None:
     Image.fromarray(array).save(path)
 
 
+def atomic_torch_save(value: Any, path: Path) -> None:
+    """Publish one cache entry atomically so interrupted writes are never resumed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
+def load_cached_distribution_sample(
+    path: Path,
+    expected_rank: int,
+    expected_local_index: int,
+) -> dict[str, Any] | None:
+    try:
+        value = torch.load(path, map_location="cpu", weights_only=False)
+    except (OSError, RuntimeError, EOFError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    if value.get("rank") != expected_rank or value.get("local_index") != expected_local_index:
+        return None
+    if not isinstance(value.get("prompt"), str):
+        return None
+    real, fake = value.get("real"), value.get("fake")
+    if not isinstance(real, torch.Tensor) or not isinstance(fake, torch.Tensor):
+        return None
+    if real.dtype != torch.uint8 or fake.dtype != torch.uint8 or real.shape != fake.shape:
+        return None
+    return value
+
+
+def distribution_cache_dir(
+    output: Path,
+    protocol: dict[str, Any],
+    rank: int,
+) -> Path:
+    encoded = json.dumps(protocol, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    root = output / "distribution_cache" / digest
+    root.mkdir(parents=True, exist_ok=True)
+    protocol_path = root / "protocol.json"
+    if not protocol_path.exists():
+        temporary = protocol_path.with_name(f".protocol.json.tmp-{os.getpid()}")
+        temporary.write_text(
+            json.dumps(protocol, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, protocol_path)
+    rank_dir = root / f"rank_{rank:02d}"
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    return rank_dir
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as file:
         return [json.loads(line) for line in file if line.strip()]
@@ -40,9 +93,12 @@ def load_reference(case: dict[str, Any], image_size: int) -> Image.Image:
         file.seek(case["offset"])
         raw = file.read(case["size"])
     image = Image.open(io.BytesIO(raw)).convert("RGB")
-    # Use the exact training/FID transform so side-by-side visual comparisons
-    # do not mistake letterboxing or a different crop for a model error.
-    return center_crop_resize(image, image_size)
+    # Fixed-case references are display artifacts; generation/FID real images use
+    # the training transform through TarMetadataDataset.
+    image.thumbnail((image_size, image_size), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (image_size, image_size), "white")
+    canvas.paste(image, ((image_size - image.width) // 2, (image_size - image.height) // 2))
+    return canvas
 
 
 def load_eval_config(path: Path) -> dict[str, Any]:
@@ -171,7 +227,18 @@ def fixed_case_evaluation(model, vae, qwen, cfg, eval_cfg, output: Path, rank: i
     torch.distributed.barrier()
 
 
-def distribution_evaluation(model, vae, qwen, cfg, eval_cfg, rank: int, world: int, max_generated: int | None):
+def distribution_evaluation(
+    model,
+    vae,
+    qwen,
+    cfg,
+    eval_cfg,
+    output: Path,
+    weights: str,
+    rank: int,
+    world: int,
+    max_generated: int | None,
+):
     from torchmetrics.image.fid import FrechetInceptionDistance
     from torchmetrics.image.kid import KernelInceptionDistance
 
@@ -182,11 +249,97 @@ def distribution_evaluation(model, vae, qwen, cfg, eval_cfg, rank: int, world: i
     local_target = total // world
     batch_size = int(metric_cfg.get("batch_size_per_gpu", 1))
     image_size = int(eval_cfg.get("image_size", cfg.data.image_size))
+    sample_steps = int(eval_cfg.get("sample_steps", 30))
+    seed_base = 20260805
+    protocol = {
+        "version": 1,
+        "weights": weights,
+        "world_size": world,
+        "num_generated": total,
+        "image_size": image_size,
+        "sample_steps": sample_steps,
+        "holdout_manifest": str(eval_cfg["holdout_manifest"]),
+        "caption_field": str(cfg.data.caption_field),
+        "seed_base": seed_base,
+    }
+    cache_dir = distribution_cache_dir(output, protocol, rank)
     dataset = TarMetadataDataset(
         eval_cfg["holdout_manifest"], image_size, cfg.data.caption_field, shuffle=False
     )
     iterator = iter(dataset)
     metric_device = torch.device("cuda", rank)
+    pending_rows: list[dict[str, Any]] = []
+    pending_indices: list[int] = []
+    cached = 0
+    generated = 0
+
+    def flush_pending() -> None:
+        nonlocal generated
+        if not pending_rows:
+            return
+        current = len(pending_rows)
+        rows = list(pending_rows)
+        local_indices = list(pending_indices)
+        real = tensor_to_uint8(torch.stack([row["pixel_values"] for row in rows]).to(rank))
+        prompts = [row["text"] for row in rows]
+        image_tokens = (image_size // 16) ** 2
+        text, attention_mask = encode_prompts(
+            qwen, model, prompts, image_tokens, cfg, torch.device("cuda", rank)
+        )
+        seeds = [seed_base + rank * local_target + index for index in local_indices]
+        fake = sample_batch(
+            model, vae, text, attention_mask, seeds,
+            sample_steps, image_size,
+        )
+        for index, prompt, real_image, fake_image in zip(
+            local_indices, prompts, real.cpu(), fake.cpu()
+        ):
+            atomic_torch_save(
+                {
+                    "version": 1,
+                    "rank": rank,
+                    "local_index": index,
+                    "global_index": rank * local_target + index,
+                    "prompt": prompt,
+                    "real": real_image.contiguous(),
+                    "fake": fake_image.contiguous(),
+                },
+                cache_dir / f"sample_{index:06d}.pt",
+            )
+        generated += current
+        pending_rows.clear()
+        pending_indices.clear()
+        if rank == 0 and (cached + generated) % max(batch_size * 10, 1) == 0:
+            print(
+                f"[eval] distribution generated local={cached + generated}/{local_target} "
+                f"resumed={cached}",
+                flush=True,
+            )
+
+    for local_index in range(local_target):
+        row = next(iterator)
+        cached_sample = load_cached_distribution_sample(
+            cache_dir / f"sample_{local_index:06d}.pt", rank, local_index
+        )
+        if cached_sample is not None:
+            cached += 1
+            continue
+        pending_rows.append(row)
+        pending_indices.append(local_index)
+        if len(pending_rows) >= batch_size:
+            flush_pending()
+    flush_pending()
+    if rank == 0:
+        print(
+            f"[eval] distribution generation complete local={local_target}/{local_target} "
+            f"resumed={cached} newly_generated={generated}",
+            flush=True,
+        )
+    torch.distributed.barrier()
+    torch.cuda.empty_cache()
+
+    # Metrics are rebuilt from durable uint8 artifacts. If metric computation is
+    # interrupted, the expensive diffusion generation is still fully resumable.
     fid = FrechetInceptionDistance(feature=2048, normalize=False).to(metric_device)
     kid = KernelInceptionDistance(subset_size=min(1000, total)).to(metric_device)
     clip_model = clip_processor = None
@@ -205,18 +358,23 @@ def distribution_evaluation(model, vae, qwen, cfg, eval_cfg, rank: int, world: i
     processed = 0
     while processed < local_target:
         current = min(batch_size, local_target - processed)
-        rows = [next(iterator) for _ in range(current)]
-        real = tensor_to_uint8(torch.stack([row["pixel_values"] for row in rows]).to(rank))
-        prompts = [row["text"] for row in rows]
-        image_tokens = (image_size // 16) ** 2
-        text, attention_mask = encode_prompts(qwen, model, prompts, image_tokens, cfg, torch.device("cuda", rank))
-        seeds = [20260805 + rank * local_target + processed + index for index in range(current)]
-        fake = sample_batch(
-            model, vae, text, attention_mask, seeds,
-            int(eval_cfg.get("sample_steps", 30)), image_size,
-        )
-        fid.update(real, real=True); fid.update(fake, real=False)
-        kid.update(real, real=True); kid.update(fake, real=False)
+        samples = []
+        for local_index in range(processed, processed + current):
+            sample = load_cached_distribution_sample(
+                cache_dir / f"sample_{local_index:06d}.pt", rank, local_index
+            )
+            if sample is None:
+                raise RuntimeError(
+                    f"missing or invalid distribution cache rank={rank} index={local_index}"
+                )
+            samples.append(sample)
+        real = torch.stack([sample["real"] for sample in samples]).to(metric_device)
+        fake = torch.stack([sample["fake"] for sample in samples]).to(metric_device)
+        prompts = [sample["prompt"] for sample in samples]
+        fid.update(real, real=True)
+        fid.update(fake, real=False)
+        kid.update(real, real=True)
+        kid.update(fake, real=False)
         if clip_model is not None:
             pil_images = [
                 Image.fromarray(image.permute(1, 2, 0).cpu().numpy()) for image in fake
@@ -240,7 +398,7 @@ def distribution_evaluation(model, vae, qwen, cfg, eval_cfg, rank: int, world: i
             clip_count += scores.numel()
         processed += current
         if rank == 0 and processed % max(batch_size * 10, 1) == 0:
-            print(f"[eval] distribution local={processed}/{local_target}", flush=True)
+            print(f"[eval] distribution metrics local={processed}/{local_target}", flush=True)
     fid_value = float(fid.compute().item())
     kid_mean, kid_std = kid.compute()
     if clip_model is not None:
@@ -311,7 +469,16 @@ def main() -> None:
     )
     if not args.skip_distribution and distribution_enabled:
         results = distribution_evaluation(
-            model, vae, qwen, cfg, eval_cfg, rank, world, args.max_generated
+            model,
+            vae,
+            qwen,
+            cfg,
+            eval_cfg,
+            output,
+            "student" if use_student else "ema_teacher",
+            rank,
+            world,
+            args.max_generated,
         )
     if rank == 0:
         metadata = {
