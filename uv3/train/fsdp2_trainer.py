@@ -632,6 +632,7 @@ def train(cfg: ExperimentConfig):
 
     bs = cfg.train.batch_size_per_gpu
     accum = max(1, cfg.train.grad_accum)
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
     max_steps = cfg.train.max_steps
     log_every = cfg.train.log_every
     if rank == 0:
@@ -882,6 +883,8 @@ def train(cfg: ExperimentConfig):
             import json as _json
             with open(os.path.join(out_dir, "metrics.jsonl"), "a") as _jf:
                 _json.dump({"step": step, "loss": loss.item(), "spd": spd,
+                            "world_size": world_size,
+                            "global_batch_size": bs * world_size * accum,
                             "max_memory_reserved_gib": mem_gib, "max_memory_reserved_pct": mem_pct,
                             "timing": ts, "timing_unit": f"sum_over_{log_every}_steps",
                             "text_bucket_counts": dict(sorted(bucket_counts.items())),

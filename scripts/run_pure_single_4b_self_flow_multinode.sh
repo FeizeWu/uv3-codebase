@@ -62,6 +62,33 @@ export UV3_MONITOR="${UV3_MONITOR:-1}"
 export UV3_MONITOR_NAME="${UV3_MONITOR_NAME:-${RUN_NAME}}"
 export CONFIG_PATH="${CONFIG}"
 
+MONITOR_ROOT="${UV3_MONITOR_ROOT:-/mnt/data/users/wfz/uv3-training-monitor}"
+MONITOR_PYTHON="${UV3_MONITOR_PYTHON:-${MONITOR_ROOT}/backend/.venv/bin/python}"
+MONITOR_PORT="${UV3_MONITOR_PORT:-8765}"
+CLOUDFLARED_BIN="${UV3_CLOUDFLARED_BIN:-/mnt/data/users/wfz/bin/cloudflared}"
+monitor_backend_pid=""
+monitor_tunnel_pid=""
+telemetry_pid=""
+train_pid=""
+eval_pid=""
+
+stop_child() {
+  local child_pid="${1:-}"
+  if [[ "${child_pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${child_pid}" 2>/dev/null; then
+    kill "${child_pid}" 2>/dev/null || true
+    wait "${child_pid}" 2>/dev/null || true
+  fi
+}
+
+cleanup() {
+  stop_child "${eval_pid}"
+  stop_child "${train_pid}"
+  stop_child "${telemetry_pid}"
+  stop_child "${monitor_tunnel_pid}"
+  stop_child "${monitor_backend_pid}"
+}
+trap cleanup EXIT INT TERM
+
 for required_path in \
   "${PYTHON_BIN}" \
   "${CONFIG}" \
@@ -134,6 +161,19 @@ mkdir -p "${TORCHINDUCTOR_CACHE_DIR}" "${UV3_CKPT_STAGING_DIR}"
 log_dir="${output_dir}/launcher_logs/node${NODE_RANK}"
 mkdir -p "${log_dir}"
 
+if [[ "${UV3_MONITOR}" == "1" ]]; then
+  for monitor_path in "${MONITOR_PYTHON}" "${MONITOR_ROOT}/backend/app/main.py" "${MONITOR_ROOT}/backend/collect_gpu_telemetry.py"; do
+    if [[ ! -e "${monitor_path}" ]]; then
+      echo "[error] missing monitor path: ${monitor_path}" >&2
+      exit 1
+    fi
+  done
+  if [[ "${NODE_RANK}" == "0" && ! -x "${CLOUDFLARED_BIN}" ]]; then
+    echo "[error] cloudflared is missing or not executable: ${CLOUDFLARED_BIN}" >&2
+    exit 1
+  fi
+fi
+
 code_fingerprint="$(sha256sum uv3/train/fsdp2_trainer.py uv3/train/fsdp2.py uv3/data/tar_dataset.py uv3/modeling/mmdit.py "${CONFIG}" | sha256sum | awk '{print $1}')"
 echo "[launch] node=${NODE_RANK}/${NNODES} master=${MASTER_ADDR}:${MASTER_PORT} gpus/node=${GPUS_PER_NODE}"
 echo "[launch] python=${PYTHON_BIN} config=${CONFIG} run=${RUN_NAME} max_steps=${MAX_STEPS}"
@@ -145,7 +185,104 @@ if [[ "${UV3_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-"${PYTHON_BIN}" -m torch.distributed.run \
+if [[ "${UV3_MONITOR}" == "1" && "${NODE_RANK}" == "0" ]]; then
+  UV3_MONITOR_RUN_DIR="${output_dir}" UV3_MONITOR_DISPLAY_NAME="${UV3_MONITOR_NAME}" \
+  UV3_MONITOR_MAX_STEPS="${MAX_STEPS}" "${PYTHON_BIN}" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+run_dir = Path(os.environ["UV3_MONITOR_RUN_DIR"])
+run_dir.mkdir(parents=True, exist_ok=True)
+target = run_dir / "run.json"
+temporary = run_dir / "run.json.tmp"
+temporary.write_text(
+    json.dumps(
+        {
+            "monitor_enabled": True,
+            "display_name": os.environ["UV3_MONITOR_DISPLAY_NAME"],
+            "train": {"max_steps": int(os.environ["UV3_MONITOR_MAX_STEPS"])},
+        },
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n",
+    encoding="utf-8",
+)
+temporary.replace(target)
+PY
+
+  UV3_RUN_ROOT="$(dirname "${output_dir}")" \
+  UV3_MONITOR_RUN_ID="${RUN_NAME}" \
+  UV3_STALE_SECONDS="${UV3_STALE_SECONDS:-180}" \
+  "${MONITOR_PYTHON}" -m uvicorn app.main:app \
+    --app-dir "${MONITOR_ROOT}/backend" \
+    --host 127.0.0.1 \
+    --port "${MONITOR_PORT}" \
+    >"${output_dir}/monitor_backend.log" 2>&1 &
+  monitor_backend_pid=$!
+
+  monitor_ready=0
+  for _ in $(seq 1 30); do
+    if curl --silent --show-error --fail --max-time 2 \
+      "http://127.0.0.1:${MONITOR_PORT}/api/health" >/dev/null 2>&1; then
+      monitor_ready=1
+      break
+    fi
+    if ! kill -0 "${monitor_backend_pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${monitor_ready}" != "1" ]]; then
+    echo "[error] monitor backend failed to become healthy; see ${output_dir}/monitor_backend.log" >&2
+    exit 1
+  fi
+
+  "${CLOUDFLARED_BIN}" tunnel --no-autoupdate \
+    --url "http://127.0.0.1:${MONITOR_PORT}" \
+    >"${output_dir}/monitor_tunnel.log" 2>&1 &
+  monitor_tunnel_pid=$!
+
+  public_url=""
+  public_ready=0
+  for _ in $(seq 1 45); do
+    public_url="$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "${output_dir}/monitor_tunnel.log" 2>/dev/null | tail -n 1 || true)"
+    if [[ -n "${public_url}" ]] && curl --silent --show-error --fail --max-time 5 \
+      "${public_url}/api/health" >/dev/null 2>&1; then
+      public_ready=1
+      break
+    fi
+    if ! kill -0 "${monitor_tunnel_pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${public_ready}" != "1" ]]; then
+    echo "[error] public monitor tunnel failed; see ${output_dir}/monitor_tunnel.log" >&2
+    exit 1
+  fi
+  printf '%s\n' "${public_url}" >"${output_dir}/monitor_url.txt"
+  echo "================================================================"
+  echo "[monitor] PUBLIC_URL=${public_url}"
+  echo "[monitor] This unauthenticated URL is reachable by anyone who has it."
+  echo "[monitor] URL file: ${output_dir}/monitor_url.txt"
+  echo "================================================================"
+fi
+
+if [[ "${NODE_RANK}" == "0" ]]; then
+  "${PYTHON_BIN}" -m torch.distributed.run \
+    --nnodes="${NNODES}" \
+    --nproc_per_node="${GPUS_PER_NODE}" \
+    --node_rank="${NODE_RANK}" \
+    --master_addr="${MASTER_ADDR}" \
+    --master_port="${MASTER_PORT}" \
+    --log-dir "${log_dir}" \
+    --tee 3 \
+    -m uv3.train.fsdp2_trainer \
+    --config "${CONFIG}" \
+    > >(tee -a "${output_dir}/stdout.log") 2>&1 &
+else
+  "${PYTHON_BIN}" -m torch.distributed.run \
   --nnodes="${NNODES}" \
   --nproc_per_node="${GPUS_PER_NODE}" \
   --node_rank="${NODE_RANK}" \
@@ -154,7 +291,34 @@ fi
   --log-dir "${log_dir}" \
   --tee 3 \
   -m uv3.train.fsdp2_trainer \
-  --config "${CONFIG}"
+  --config "${CONFIG}" &
+fi
+train_pid=$!
+
+if [[ "${UV3_MONITOR}" == "1" ]]; then
+  "${MONITOR_PYTHON}" "${MONITOR_ROOT}/backend/collect_gpu_telemetry.py" \
+    --output "${output_dir}/gpu_telemetry.node${NODE_RANK}.jsonl" \
+    --interval "${UV3_GPU_TELEMETRY_INTERVAL:-2}" \
+    --pid "${train_pid}" \
+    --node-rank "${NODE_RANK}" \
+    >"${output_dir}/gpu_telemetry.node${NODE_RANK}.log" 2>&1 &
+  telemetry_pid=$!
+fi
+
+if wait "${train_pid}"; then
+  train_status=0
+else
+  train_status=$?
+fi
+train_pid=""
+if [[ -n "${telemetry_pid}" ]]; then
+  wait "${telemetry_pid}" 2>/dev/null || true
+  telemetry_pid=""
+fi
+if [[ "${train_status}" != "0" ]]; then
+  echo "[error] torchrun failed with status ${train_status}" >&2
+  exit "${train_status}"
+fi
 
 # torchrun returns only after every worker on every node has exited.  All four
 # training nodes are therefore clear before node rank 0 reuses its eight GPUs
@@ -182,4 +346,32 @@ RUN_DIR="${output_dir}" \
 CHECKPOINT="${checkpoint}" \
 EVAL_CONFIG="${EVAL_CONFIG:-${REPO_ROOT}/configs/eval_4b_test.yaml}" \
 MASTER_PORT="${EVAL_MASTER_PORT:-29685}" \
-"${REPO_ROOT}/scripts/run_eval_4b_8gpu.sh"
+"${REPO_ROOT}/scripts/run_eval_4b_8gpu.sh" \
+  > >(tee -a "${output_dir}/stdout.log") 2>&1 &
+eval_pid=$!
+
+if [[ "${UV3_MONITOR}" == "1" ]]; then
+  "${MONITOR_PYTHON}" "${MONITOR_ROOT}/backend/collect_gpu_telemetry.py" \
+    --output "${output_dir}/gpu_telemetry.node0.jsonl" \
+    --interval "${UV3_GPU_TELEMETRY_INTERVAL:-2}" \
+    --pid "${eval_pid}" \
+    --node-rank 0 \
+    >>"${output_dir}/gpu_telemetry.node0.log" 2>&1 &
+  telemetry_pid=$!
+fi
+
+if wait "${eval_pid}"; then
+  eval_status=0
+else
+  eval_status=$?
+fi
+eval_pid=""
+if [[ -n "${telemetry_pid}" ]]; then
+  wait "${telemetry_pid}" 2>/dev/null || true
+  telemetry_pid=""
+fi
+if [[ "${eval_status}" != "0" ]]; then
+  echo "[error] final evaluation failed with status ${eval_status}" >&2
+  exit "${eval_status}"
+fi
+echo "[eval] final student evaluation complete"
