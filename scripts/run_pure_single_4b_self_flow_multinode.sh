@@ -88,7 +88,9 @@ for required_path in \
   "${CONFIG}" \
   "${MANIFEST}" \
   "/mnt/data/users/wfz/checkpoints/black-forest-labs/FLUX.2-dev/vae" \
-  "/mnt/data/share/checkpoints/Qwen/Qwen3.5-9B"; do
+  "/mnt/data/share/checkpoints/Qwen/Qwen3.5-9B" \
+  "/mnt/data/share/checkpoints/openai-mirror/clip-vit-base-patch32" \
+  "/mnt/data/users/wfz/checkpoints/torch-cache/hub/checkpoints/weights-inception-2015-12-05-6726825d.pth"; do
   if [[ ! -e "${required_path}" ]]; then
     echo "[error] missing required path: ${required_path}" >&2
     exit 1

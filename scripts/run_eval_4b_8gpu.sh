@@ -18,15 +18,28 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export TORCH_HOME="${TORCH_HOME:-/mnt/data/users/wfz/checkpoints/torch-cache}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-3}"
 
-for required_path in "${PYTHON_BIN}" "${TRAIN_CONFIG}" "${EVAL_CONFIG}" "${CHECKPOINT}"; do
+INCEPTION_WEIGHTS="${TORCH_HOME}/hub/checkpoints/weights-inception-2015-12-05-6726825d.pth"
+for required_path in \
+  "${PYTHON_BIN}" \
+  "${TRAIN_CONFIG}" \
+  "${EVAL_CONFIG}" \
+  "${CHECKPOINT}" \
+  "${INCEPTION_WEIGHTS}" \
+  "/mnt/data/share/checkpoints/openai-mirror/clip-vit-base-patch32"; do
   if [[ ! -e "${required_path}" ]]; then
     echo "[error] missing required path: ${required_path}" >&2
     exit 1
   fi
 done
+inception_sha256="$(sha256sum "${INCEPTION_WEIGHTS}" | awk '{print $1}')"
+if [[ "${inception_sha256}" != "6726825d0af5f729cebd5821db510b11b1cfad8faad88a03f1befd49fb9129b2" ]]; then
+  echo "[error] invalid Inception weight: ${INCEPTION_WEIGHTS} sha256=${inception_sha256}" >&2
+  exit 1
+fi
 if [[ "${GPUS_PER_NODE}" != "8" ]]; then
   echo "[error] evaluation config expects an 8-way FSDP mesh" >&2
   exit 1
