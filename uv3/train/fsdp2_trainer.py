@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import random
+import shutil
 import time
 from dataclasses import asdict
 
@@ -148,6 +149,57 @@ def _ema_update_local_shards_(teacher: nn.Module, student: nn.Module, decay: flo
                 f"EMA local shard shape mismatch at {name}: {dst.shape} != {src.shape}"
             )
         dst.lerp_(src, weight)
+
+
+def _reconcile_monitor_metrics_for_resume(out_dir: str, start_step: int) -> dict:
+    """Keep one monotonic metrics branch ending immediately before the checkpoint."""
+    metrics_path = os.path.join(out_dir, "metrics.jsonl")
+    event = {
+        "type": "resume",
+        "timestamp": time.time(),
+        "checkpoint_step": int(start_step),
+        "kept_metric_rows": 0,
+        "discarded_metric_rows": 0,
+        "metrics_archive": None,
+    }
+    if os.path.exists(metrics_path):
+        valid_before: dict[int, str] = {}
+        discarded: list[str] = []
+        with open(metrics_path, encoding="utf-8", errors="replace") as metrics_file:
+            for line in metrics_file:
+                try:
+                    row = json.loads(line)
+                    step = int(row["step"])
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    discarded.append(line)
+                    continue
+                if step < start_step:
+                    # A run produced by an older launcher may already contain
+                    # duplicate steps. Keep the newest value for each step.
+                    valid_before[step] = line if line.endswith("\n") else line + "\n"
+                else:
+                    discarded.append(line)
+        with open(metrics_path, encoding="utf-8", errors="replace") as metrics_file:
+            original_rows = sum(1 for _ in metrics_file)
+        needs_rewrite = len(valid_before) + len(discarded) != original_rows or bool(discarded)
+        if needs_rewrite:
+            timestamp = int(event["timestamp"])
+            archive_path = os.path.join(
+                out_dir,
+                f"metrics.pre_resume_step_{start_step:08d}_{timestamp}.jsonl",
+            )
+            shutil.copyfile(metrics_path, archive_path)
+            temporary = metrics_path + ".resume.tmp"
+            with open(temporary, "w", encoding="utf-8") as metrics_file:
+                for step in sorted(valid_before):
+                    metrics_file.write(valid_before[step])
+            os.replace(temporary, metrics_path)
+            event["metrics_archive"] = os.path.basename(archive_path)
+        event["kept_metric_rows"] = len(valid_before)
+        event["discarded_metric_rows"] = len(discarded)
+    with open(os.path.join(out_dir, "events.jsonl"), "a", encoding="utf-8") as events_file:
+        events_file.write(json.dumps(event, ensure_ascii=False) + "\n")
+    return event
 
 
 class DataPrefetcher:
@@ -560,7 +612,15 @@ def train(cfg: ExperimentConfig):
                     g.set_state(restored_rng["py_gen"])
             resumed_epoch = ck.get("data_status", {}).get("epoch", 0) or 0
             if rank == 0:
+                resume_event = _reconcile_monitor_metrics_for_resume(out_dir, start_step)
                 print(f"[train] resumed from step {start_step} (epoch {resumed_epoch})", flush=True)
+                print(
+                    "[train] monitor resume reconciled "
+                    f"kept={resume_event['kept_metric_rows']} "
+                    f"discarded={resume_event['discarded_metric_rows']} "
+                    f"archive={resume_event['metrics_archive']}",
+                    flush=True,
+                )
                 print(
                     "[train] WARNING: model/optimizer/per-rank RNG are exact, but "
                     "the multi-worker text-bucket data cursor restarts at the saved epoch",
