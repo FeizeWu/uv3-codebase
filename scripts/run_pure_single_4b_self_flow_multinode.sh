@@ -64,10 +64,6 @@ export CONFIG_PATH="${CONFIG}"
 
 MONITOR_ROOT="${UV3_MONITOR_ROOT:-/mnt/data/users/wfz/uv3-training-monitor}"
 MONITOR_PYTHON="${UV3_MONITOR_PYTHON:-${MONITOR_ROOT}/backend/.venv/bin/python}"
-MONITOR_PORT="${UV3_MONITOR_PORT:-8765}"
-CLOUDFLARED_BIN="${UV3_CLOUDFLARED_BIN:-/mnt/data/users/wfz/bin/cloudflared}"
-monitor_backend_pid=""
-monitor_tunnel_pid=""
 telemetry_pid=""
 train_pid=""
 eval_pid=""
@@ -84,8 +80,6 @@ cleanup() {
   stop_child "${eval_pid}"
   stop_child "${train_pid}"
   stop_child "${telemetry_pid}"
-  stop_child "${monitor_tunnel_pid}"
-  stop_child "${monitor_backend_pid}"
 }
 trap cleanup EXIT INT TERM
 
@@ -162,16 +156,12 @@ log_dir="${output_dir}/launcher_logs/node${NODE_RANK}"
 mkdir -p "${log_dir}"
 
 if [[ "${UV3_MONITOR}" == "1" ]]; then
-  for monitor_path in "${MONITOR_PYTHON}" "${MONITOR_ROOT}/backend/app/main.py" "${MONITOR_ROOT}/backend/collect_gpu_telemetry.py"; do
+  for monitor_path in "${MONITOR_PYTHON}" "${MONITOR_ROOT}/backend/collect_gpu_telemetry.py"; do
     if [[ ! -e "${monitor_path}" ]]; then
       echo "[error] missing monitor path: ${monitor_path}" >&2
       exit 1
     fi
   done
-  if [[ "${NODE_RANK}" == "0" && ! -x "${CLOUDFLARED_BIN}" ]]; then
-    echo "[error] cloudflared is missing or not executable: ${CLOUDFLARED_BIN}" >&2
-    exit 1
-  fi
 fi
 
 code_fingerprint="$(sha256sum uv3/train/fsdp2_trainer.py uv3/train/fsdp2.py uv3/data/tar_dataset.py uv3/modeling/mmdit.py "${CONFIG}" | sha256sum | awk '{print $1}')"
@@ -210,63 +200,7 @@ temporary.write_text(
 )
 temporary.replace(target)
 PY
-
-  UV3_RUN_ROOT="$(dirname "${output_dir}")" \
-  UV3_MONITOR_RUN_ID="${RUN_NAME}" \
-  UV3_STALE_SECONDS="${UV3_STALE_SECONDS:-180}" \
-  "${MONITOR_PYTHON}" -m uvicorn app.main:app \
-    --app-dir "${MONITOR_ROOT}/backend" \
-    --host 127.0.0.1 \
-    --port "${MONITOR_PORT}" \
-    >"${output_dir}/monitor_backend.log" 2>&1 &
-  monitor_backend_pid=$!
-
-  monitor_ready=0
-  for _ in $(seq 1 30); do
-    if curl --silent --show-error --fail --max-time 2 \
-      "http://127.0.0.1:${MONITOR_PORT}/api/health" >/dev/null 2>&1; then
-      monitor_ready=1
-      break
-    fi
-    if ! kill -0 "${monitor_backend_pid}" 2>/dev/null; then
-      break
-    fi
-    sleep 1
-  done
-  if [[ "${monitor_ready}" != "1" ]]; then
-    echo "[error] monitor backend failed to become healthy; see ${output_dir}/monitor_backend.log" >&2
-    exit 1
-  fi
-
-  "${CLOUDFLARED_BIN}" tunnel --no-autoupdate \
-    --url "http://127.0.0.1:${MONITOR_PORT}" \
-    >"${output_dir}/monitor_tunnel.log" 2>&1 &
-  monitor_tunnel_pid=$!
-
-  public_url=""
-  public_ready=0
-  for _ in $(seq 1 45); do
-    public_url="$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "${output_dir}/monitor_tunnel.log" 2>/dev/null | tail -n 1 || true)"
-    if [[ -n "${public_url}" ]] && curl --silent --show-error --fail --max-time 5 \
-      "${public_url}/api/health" >/dev/null 2>&1; then
-      public_ready=1
-      break
-    fi
-    if ! kill -0 "${monitor_tunnel_pid}" 2>/dev/null; then
-      break
-    fi
-    sleep 1
-  done
-  if [[ "${public_ready}" != "1" ]]; then
-    echo "[error] public monitor tunnel failed; see ${output_dir}/monitor_tunnel.log" >&2
-    exit 1
-  fi
-  printf '%s\n' "${public_url}" >"${output_dir}/monitor_url.txt"
-  echo "================================================================"
-  echo "[monitor] PUBLIC_URL=${public_url}"
-  echo "[monitor] This unauthenticated URL is reachable by anyone who has it."
-  echo "[monitor] URL file: ${output_dir}/monitor_url.txt"
-  echo "================================================================"
+  echo "[monitor] run registered in shared storage; public UI starts separately on demand"
 fi
 
 if [[ "${NODE_RANK}" == "0" ]]; then
