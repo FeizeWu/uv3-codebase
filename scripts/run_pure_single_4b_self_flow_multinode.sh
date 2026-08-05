@@ -15,10 +15,10 @@ export MASTER_PORT="${MASTER_PORT:-29675}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-# Requiring these prevents four nodes from deriving different timestamp-based
-# names or accidentally running the YAML's short default budget.
-: "${RUN_NAME:?set one identical RUN_NAME on all four nodes}"
-: "${MAX_STEPS:?set one identical MAX_STEPS on all four nodes}"
+# Static defaults are identical on every node even when the platform only
+# injects WORLD_SIZE/RANK/MASTER_* variables.  Callers may still override both.
+RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_4node_10k}"
+MAX_STEPS="${MAX_STEPS:-10000}"
 
 if [[ "${NNODES}" != "4" ]]; then
   echo "[error] this launcher is fixed for 4 nodes; got NNODES=${NNODES}" >&2
