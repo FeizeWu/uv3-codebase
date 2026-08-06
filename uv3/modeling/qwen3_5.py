@@ -1,7 +1,7 @@
-"""Qwen3.5-9B as a frozen text-feature encoder for the MMDiT.
+"""Qwen3.5 dense models as frozen text-feature encoders for the MMDiT.
 
 Loads Qwen3_5ForConditionalGeneration, keeps only the language_model (text backbone,
-hidden=4096), forwards (input_ids, attention_mask) -> last_hidden_state, projected to
+forwards (input_ids, attention_mask) -> last_hidden_state, projected to
 the MMDiT inner_dim by a trainable bridge. The vision/understanding head is NOT used
 this phase (efficiency-verification period; no understanding loss).
 """
@@ -16,7 +16,7 @@ class Qwen3_5TextEncoder(nn.Module):
         super().__init__()
         self.language_model = language_model
         self.tokenizer = tokenizer
-        self.hidden_size = hidden_size      # 4096
+        self.hidden_size = hidden_size
         self.max_length = max_length
         for p in self.parameters():
             p.requires_grad_(False)
@@ -46,7 +46,7 @@ class Qwen3_5TextEncoder(nn.Module):
 
     @torch.no_grad()
     def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """(B, L) ids+mask -> (B, L, 4096) last_hidden_state."""
+        """(B, L) ids+mask -> (B, L, hidden_size) last_hidden_state."""
         out = self.language_model(
             input_ids=input_ids, attention_mask=attention_mask, use_cache=False
         )
@@ -69,7 +69,7 @@ class Qwen3_5TextEncoder(nn.Module):
 
 
 class Qwen3_5EmbeddingBridge(nn.Module):
-    """Trainable projection Qwen3.5 hidden (4096) -> MMDiT inner_dim."""
+    """Trainable projection from Qwen3.5 hidden size to MMDiT inner_dim."""
 
     def __init__(self, encoder: Qwen3_5TextEncoder, output_dim: int):
         super().__init__()

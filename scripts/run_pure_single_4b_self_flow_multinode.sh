@@ -15,13 +15,13 @@ export MASTER_PORT="${MASTER_PORT:-29675}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-# Resume the completed 10k run by default. MAX_STEPS is the final total step,
-# not the number of extra steps, so 20000 continues for another 10000 steps.
-# These defaults are identical on every node; callers may override MAX_STEPS.
-RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_4node_10k}"
-MAX_STEPS="${MAX_STEPS:-20000}"
-ALLOW_RESUME="${ALLOW_RESUME:-1}"
-RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:-10000}"
+# Qwen3.5-4B changes the MMDiT context projection shape, so this launcher starts
+# a new run by default.  Resume must be requested explicitly with a compatible
+# checkpoint produced by this same configuration.
+RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_qwen4b_4node}"
+MAX_STEPS="${MAX_STEPS:-10000}"
+ALLOW_RESUME="${ALLOW_RESUME:-0}"
+RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:-0}"
 
 if [[ "${NNODES}" != "4" ]]; then
   echo "[error] this launcher is fixed for 4 nodes; got NNODES=${NNODES}" >&2
@@ -99,7 +99,7 @@ for required_path in \
   "${CONFIG}" \
   "${MANIFEST}" \
   "/mnt/data/users/wfz/checkpoints/black-forest-labs/FLUX.2-dev/vae" \
-  "/mnt/data/share/checkpoints/Qwen/Qwen3.5-9B" \
+  "/mnt/data/share/checkpoints/Qwen/Qwen3.5-4B" \
   "/mnt/data/share/checkpoints/openai-mirror/clip-vit-base-patch32" \
   "/mnt/data/users/wfz/checkpoints/torch-cache/hub/checkpoints/weights-inception-2015-12-05-6726825d.pth"; do
   if [[ ! -e "${required_path}" ]]; then
@@ -124,6 +124,7 @@ export UV3_LAUNCH_MANIFEST="${MANIFEST}"
 "${PYTHON_BIN}" - <<'PY'
 import os
 from pathlib import Path
+from transformers import AutoConfig
 from uv3.config import load_config
 from uv3.train.fsdp2 import resolve_mesh_shape
 
@@ -157,10 +158,24 @@ if sf.student_depth_ratio != 0.3 or sf.teacher_depth_ratio != 0.7:
     errors.append(
         f"self_flow.depth_ratios={sf.student_depth_ratio!r}->{sf.teacher_depth_ratio!r}"
     )
-if cfg.train.timestep_strategy != "logit_normal_shift" or cfg.train.timestep_shift != 4.63:
+if (
+    cfg.train.timestep_strategy != "logit_normal"
+    or cfg.train.timestep_logit_mean != 0.0
+    or cfg.train.timestep_logit_std != 1.0
+    or cfg.train.timestep_shift is not None
+):
     errors.append(
-        f"timestep={cfg.train.timestep_strategy!r}/shift={cfg.train.timestep_shift!r}"
+        f"timestep={cfg.train.timestep_strategy!r}/"
+        f"mu={cfg.train.timestep_logit_mean!r}/"
+        f"std={cfg.train.timestep_logit_std!r}/shift={cfg.train.timestep_shift!r}"
     )
+expected_qwen = Path("/mnt/data/share/checkpoints/Qwen/Qwen3.5-4B")
+if Path(cfg.model.qwen_vl.pretrained) != expected_qwen:
+    errors.append(f"config qwen.pretrained={cfg.model.qwen_vl.pretrained!r}")
+qwen_config = AutoConfig.from_pretrained(expected_qwen, local_files_only=True)
+qwen_text_config = getattr(qwen_config, "text_config", qwen_config)
+if qwen_text_config.hidden_size != 2560:
+    errors.append(f"Qwen3.5-4B hidden_size={qwen_text_config.hidden_size!r}")
 if cfg.train.compile_vae and cfg.train.vae_compile_mode != "max-autotune-no-cudagraphs":
     errors.append(f"unsafe vae_compile_mode={cfg.train.vae_compile_mode!r}")
 if cfg.train.num_shard != 8: errors.append(f"num_shard={cfg.train.num_shard!r}")

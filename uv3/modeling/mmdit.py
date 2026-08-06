@@ -21,6 +21,34 @@ from .flow import interpolate, logit_normal_timesteps, velocity_target, euler_sc
 from .vae import patchify_latents, unpatchify_latents
 
 
+class _PerTokenAdaLayerNormContinuous(nn.Module):
+    """AdaLayerNormContinuous compatible with scalar or per-token conditions.
+
+    Keeping this as one module is important for FSDP2: its pre-forward hook
+    converts both inputs and parameters consistently before this method runs.
+    The child names match diffusers, so checkpoint keys remain unchanged.
+    """
+
+    def __init__(self, base: nn.Module):
+        super().__init__()
+        self.silu = base.silu
+        self.linear = base.linear
+        self.norm = base.norm
+
+    def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
+        emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
+        if conditioning_embedding.ndim == 2:
+            scale, shift = torch.chunk(emb, 2, dim=1)
+            return self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+        if conditioning_embedding.ndim == 3:
+            scale, shift = torch.chunk(emb, 2, dim=-1)
+            return self.norm(x) * (1 + scale) + shift
+        raise ValueError(
+            "conditioning_embedding must be (B,D) or (B,N,D), got "
+            f"{tuple(conditioning_embedding.shape)}"
+        )
+
+
 def _positions(batch: int, h: int, w: int, device) -> torch.Tensor:
     y, x = torch.meshgrid(
         torch.arange(h, device=device), torch.arange(w, device=device), indexing="ij"
@@ -39,6 +67,7 @@ class MMDiT(nn.Module):
 
     def __init__(self, transformer: Flux2Transformer2DModel, in_channels: int, latent_channels: int, flex_attention: bool = False):
         super().__init__()
+        transformer.norm_out = _PerTokenAdaLayerNormContinuous(transformer.norm_out)
         self.transformer = transformer
         self.in_channels = in_channels            # 128 = latent_ch * 4 (packed)
         self.latent_channels = latent_channels   # 32
@@ -93,7 +122,7 @@ class MMDiT(nn.Module):
         self,
         hidden_states: torch.Tensor,      # (B, N_ref+N_img, in_channels)
         encoder_hidden_states: torch.Tensor,  # (B, N_txt, joint_dim)
-        sample_t: torch.Tensor,           # (B,) scalar t for txt/norm_out
+        sample_t: torch.Tensor,           # (B,) scalar t for text-stream modulation
         token_timesteps: torch.Tensor,    # (B, N_ref+N_img) per-token t for img modulation
         img_ids: torch.Tensor,            # (N_img_pos, 4) or (B, N, 4)
         txt_ids: torch.Tensor,            # (N_txt_pos, 4) or (B, N, 4)
@@ -173,9 +202,12 @@ class MMDiT(nn.Module):
                 joint_attention_kwargs=jakw,
             )
 
-        # --- 7. Output: drop txt, keep img (skip ref tokens) ---
+        # --- 7. Output: drop txt/ref, keep target image tokens ---
         out = hidden_states[:, n_txt + num_ref_tokens:]                      # (B, N_img, D)
-        out = t.norm_out(out, temb_scalar)                                    # AdaLayerNormContinuous, per-sample
+        # Self-Flow retains heterogeneous token timesteps through the output
+        # head too, matching UniWorld's per-token FinalLayer.
+        out_temb = temb_tt[:, num_ref_tokens:]
+        out = t.norm_out(out, out_temb)
         out = t.proj_out(out)                                                 # (B, N_img, in_channels)
         return out
 

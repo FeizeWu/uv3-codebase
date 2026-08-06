@@ -1,7 +1,7 @@
 """flow.py unit tests: velocity sign = noise - clean, interpolate endpoints, euler recovers clean."""
 import torch
 from uv3.modeling.flow import interpolate, velocity_target, euler_schedule, euler_step
-from uv3.data.noise_scheduler import sample_timesteps, timestep_bin_sums
+from uv3.data.noise_scheduler import calculate_shift, sample_timesteps, timestep_bin_sums
 
 
 def test_velocity_sign():
@@ -43,6 +43,26 @@ def test_timestep_sampler_direction_and_bins():
     counts, sums, _ = timestep_bin_sums(t, losses)
     assert counts[[0, 1, 9]].tolist() == [2, 1, 2]
     assert sums[[0, 1, 9]].tolist() == [4, 5, 16]
+
+
+def test_dynamic_timestep_shift_uses_log_domain_mu():
+    assert calculate_shift(256, 256, 4096, 0.5, 1.15) == 0.5
+    assert calculate_shift(4096, 256, 4096, 0.5, 1.15) == 1.15
+
+    # Reuse identical Gaussian draws: more image tokens -> larger mu -> larger
+    # alpha=exp(mu) -> more mass toward UV3's t=1 noisy endpoint.
+    torch.manual_seed(11)
+    low = sample_timesteps(
+        8192, "cpu", strategy="logit_normal_shift", image_seq_len=256,
+        base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15,
+    )
+    torch.manual_seed(11)
+    high = sample_timesteps(
+        8192, "cpu", strategy="logit_normal_shift", image_seq_len=4096,
+        base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15,
+    )
+    assert torch.all(high > low)
+    assert low.median() > 0.5
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ model:
   flex_attention: true
   alpha_on: false
   vae: {backend: diffusers, pretrained: /mnt/data/users/wfz/checkpoints/black-forest-labs/FLUX.2-dev, subfolder: vae, trainable: false}
-  qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-9B, trainable: false, max_length: 1024}
+  qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-4B, trainable: false, max_length: 1024}
   transformer: {backend: random, trainable: true}
   self_flow:
     enabled: true
@@ -79,11 +79,11 @@ train:
   wandb: false
   log_every: 10
   seed: 42
-  # FLUX.2 Self-Flow image setting: both t and s independently use this p(t).
-  timestep_strategy: logit_normal_shift
+  # Keep the established 10k-run baseline: both Self-Flow timesteps are sampled
+  # independently from the same unshifted Logit-Normal distribution.
+  timestep_strategy: logit_normal
   timestep_logit_mean: 0.0
   timestep_logit_std: 1.0
-  timestep_shift: 4.63
   timestep_metrics: true
   optimizer:
     optimizer: adamw

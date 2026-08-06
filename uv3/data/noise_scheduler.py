@@ -18,12 +18,12 @@ def calculate_shift(
     base_shift: float = 0.5,
     max_shift: float = 0.9,
 ) -> float:
-    """Flux resolution-dependent shift: linear in log(seq_len) between base/max."""
+    """Return Flux's log-domain shift ``mu``, linear in image-token count."""
     if max_seq_len == base_seq_len:
         return base_shift
-    m = (max_shift - base_shift) / (math.log(max_seq_len) - math.log(base_seq_len))
-    b = base_shift - m * math.log(base_seq_len)
-    return m * math.log(max(image_seq_len, 1)) + b
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    return m * max(image_seq_len, 1) + b
 
 
 def sample_timesteps(
@@ -51,13 +51,16 @@ def sample_timesteps(
             torch.randn(batch_size, device=device) * logit_std + logit_mean
         )
         if shift is None:
-            shift = calculate_shift(
+            # calculate_shift follows BFL/Unimm and returns log-domain mu;
+            # shift_timesteps expects the positive rational factor alpha.
+            mu = calculate_shift(
                 image_seq_len or base_seq_len,
                 base_seq_len=base_seq_len,
                 max_seq_len=max_seq_len,
                 base_shift=base_shift,
                 max_shift=max_shift,
             )
+            shift = math.exp(mu)
         t = shift_timesteps(t, shift)
     else:
         raise ValueError(f"unknown timestep strategy: {strategy}")
