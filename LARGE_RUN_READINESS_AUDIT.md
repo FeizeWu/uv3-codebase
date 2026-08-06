@@ -149,6 +149,7 @@ descriptor 虽产生 `shard_pos/row_pos`，但 batch materialize 丢掉这些 ID
 已知有意差异，不直接判定为 bug：
 
 - 当前测速/训练使用 AdamW；UniWorld 实验使用 Muon+Adam。
+- 当前 AdamW betas 为 `(0.9, 0.95)`，UniWorld 默认 AdamW 为 `(0.9, 0.999)`；当前每步还会做 gradient clipping 1.0，而参考实现没有 clipping。两项都应作为明确的训练超参决定，并通过短程 grad-norm/clip-rate 统计确认，而不能默认为与参考实现一致。
 - 当前评估固定 student；UniWorld validation 使用 EMA。两套曲线不能直接横向比较。
 - 当前 Self-Flow coeff 为 `0.8`；参考实际脚本为 `0.5`。需要作为超参决策，而不是默认为“已对齐”。
 - 对齐层数按要求不纳入本审计。
@@ -203,10 +204,11 @@ trainer 使用 `min(student_tokens, teacher_tokens)` 后截断两边；参考实
 
 - `warmup_steps`、`lr_schedule` 没有实际 scheduler 实现；当前 100K 将使用恒定 `1e-4`，除非另行修改。
 - `mixed_precision`、`sharding_strategy`、`compile_dynamic` 等部分字段未真正控制 trainer，实际行为有硬编码。
+- YAML 解析只提取 dataclass 已知字段，未知字段会被静默丢弃；配置键拼错时不会失败，而会悄悄使用默认值。UniWorld 对未知字段会在 dataclass 构造时抛错。
 - `grad_accum>1` 时 step/checkpoint/eval 仍按 microbatch 计数，未使用 FSDP `no_sync`，checkpoint 可能落在累积中途且不会保存梯度。
 - student 与 projector 分开 clip，不等价于统一 global norm。
 
-当前 `grad_accum=1` 避开部分问题，但应增加配置约束，避免未来误用。
+当前 `grad_accum=1` 避开部分问题，但应增加配置约束，避免未来误用。建议增加 unknown-key fail-fast 测试，并逐个验证 production YAML 中声明的字段确实改变 effective config/runtime。
 
 ### P1-05：数据读取存在静默跳过与配置失效风险
 
@@ -267,6 +269,12 @@ P 模式且带 byte transparency 的图片直接 `.convert("RGB")` 会触发用�
 
 trainer 缺少 `try/finally destroy_process_group()`；用户日志中的 warning 是异常退出的次生问题。还缺少真实多节点 rank crash、SIGTERM、网络故障的 bounded shutdown 测试。
 
+### P1-11：监控首页的总 loss 不是全局 loss
+
+trainer 将 rank0 的 `loss.item()` 直接写入 JSON，没有对总 loss 做跨 rank all-reduce；UniWorld 会先对 logged loss 做全局平均。UV3 的 FM/Self-Flow 分项会经 resolution 统计做全局归约，因此当前页面上的 `total loss` 与两个分项的统计口径并不一致。
+
+这不改变反向传播，但会误导大型实验的趋势判断和跨 run 对比。建议测试：构造各 rank 不同的已知 loss，断言日志总 loss 等于全局加权平均，并明确分桶/总 loss 是否按样本数或 token 数加权。
+
 ## P2：可在阻断项后处理
 
 - code fingerprint 未覆盖 `self_flow.py`、`flow.py`、noise scheduler、bucket sampler、FlexAttention/eval 关键文件，也未写入 checkpoint 强校验。
@@ -276,6 +284,7 @@ trainer 缺少 `try/finally destroy_process_group()`；用户日志中的 warnin
 - throughput 在未来 `grad_accum>1` 时可能口径错误。
 - tar short read 当前直接按坏图处理；更稳妥的语义是关闭并重开 handle、有限重试，仍失败才计坏图，以区分 OSS 瞬时读取问题。
 - 生产训练集首次 100K 预计尚未走到 epoch 尾部，但更长实验需要 rank 等长/padding 合约；manifest raw sample rank spread 抽样约 `1.17%`。
+- `ModelConfig.head_dim`、`axes_dims_rope`、`in_channels`、`out_channels` 当前没有真正参与 MMDiT 构造；`patch_size` 的名字可配置，但 patchify 实现固定为 2×2。当前生产值恰好与实际实现一致，因此尚未触发错误，但未来改配置时应 fail-fast 或真正贯穿实现。
 
 ## 建议审批顺序
 
