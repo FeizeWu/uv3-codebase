@@ -26,12 +26,16 @@ class ComponentConfig:
 @dataclass
 class SelfFlowConfig:
     enabled: bool = True
-    coeff: float = 1.0                     # projection-loss weight
-    teacher_depth: int = -1               # teacher single-block index (-1 = last)
-    student_depth: int = -1               # first available stream index (-1 = first)
-    timestep_mode: str = "ratio"          # ratio | random_cleaner | min
-    ratio: float = 0.5                    # paired_t = t * ratio (for ratio mode)
-    mask_ratio: float = 0.5               # per-token timestep masking probability
+    coeff: float = 0.8                     # Self-Flow paper image setting
+    # Explicit global block indices override the depth ratios when provided.
+    # Ratios scale the paper's 0.3D -> 0.7D alignment to arbitrary model depths.
+    teacher_depth: int | None = None
+    student_depth: int | None = None
+    teacher_depth_ratio: float = 0.7
+    student_depth_ratio: float = 0.3
+    timestep_mode: str = "independent"    # independent | ratio | random_cleaner | min
+    ratio: float = 0.5                    # legacy ablation: paired_t = t * ratio
+    mask_ratio: float = 0.25              # Self-Flow paper image setting
     ema_decay: float = 0.9999
     projector_dim: int | None = None      # None => 2*hidden
     n_txt: int = 64                       # text token count (for img segment slicing)

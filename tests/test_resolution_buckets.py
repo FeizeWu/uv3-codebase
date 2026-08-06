@@ -15,6 +15,7 @@ from uv3.train.fsdp2_trainer import (
     OnlineJointBucketBatcher,
     _align_text_to_joint_length,
     _smooth_weighted_schedule,
+    format_resolution_bucket_loss,
 )
 
 
@@ -182,3 +183,25 @@ def test_joint_alignment_adds_only_invalid_slots():
     assert torch.equal(aligned_text[:, :8], text)
     assert aligned_mask[:, :8].all()
     assert not aligned_mask[:, 8:].any()
+
+
+def test_resolution_bucket_loss_formats_global_sums():
+    buckets = (
+        AspectBucket("square", 32, 32),
+        AspectBucket("landscape", 48, 16),
+    )
+    reduced = torch.tensor([
+        [4.0, 0.0],
+        [8.0, 0.0],
+        [2.0, 0.0],
+    ], dtype=torch.float64)
+    result = format_resolution_bucket_loss(
+        reduced, buckets, sf_enabled=True, sf_coeff=0.8,
+    )
+    assert result["names"] == ["square", "landscape"]
+    assert result["width"] == [32, 48]
+    assert result["height"] == [32, 16]
+    assert result["count"] == [4, 0]
+    assert result["fm_loss"] == [2.0, 0.0]
+    assert result["self_flow_loss"] == [0.5, 0.0]
+    assert result["total_loss"] == [2.4, 0.0]

@@ -1,9 +1,8 @@
-"""Self-flow matching (BFL Self-Flow), ported to continuous rectified-flow.
+"""Self-flow matching (BFL Self-Flow), using continuous rectified-flow timesteps.
 
-UniWorld third_party/DiT/train.py self-flow is built on DISCRETE DDPM timesteps
-(q_sample/num_timesteps/timestep_to_clean_fraction). Here we use CONTINUOUS t in [0,1]
-(t=0 clean, t=1 noise, flow.py convention), so the latent construction is re-derived:
-- teacher timestep t_teacher = t_student * ratio  (closer to clean, smaller t)
+Both timesteps are independently sampled from the training distribution. Here t is in
+[0,1] with t=0 clean and t=1 noise, matching flow.py:
+- teacher timestep t_teacher = min(t, s)
 - student latents use per-token mixing between student(t) and paired(t*?) tokens
 - EMA teacher forward at t_teacher (no grad) -> capture block-N features
 - student forward -> capture block-M features (M<N) -> project -> cosine align to teacher
@@ -50,6 +49,7 @@ class FeatureCapture:
         self._handles = []
         self.stream = stream
         self.n_txt = n_txt
+        self.global_depth: int | None = None
 
     def attach(self, module: nn.Module):
         def hook(_m, _i, out):
@@ -78,60 +78,75 @@ class FeatureCapture:
 def attach_self_flow_feature_captures(
     student: nn.Module,
     teacher: nn.Module,
-    student_depth: int = -1,
-    teacher_depth: int = -1,
-) -> tuple[FeatureCapture, FeatureCapture, bool]:
+    student_depth: int | None = None,
+    teacher_depth: int | None = None,
+    student_depth_ratio: float = 0.3,
+    teacher_depth_ratio: float = 0.7,
+) -> tuple[FeatureCapture, FeatureCapture, bool, bool]:
     """Attach Self-Flow hooks for dual/single-stream and pure-single MMDiTs.
 
-    The default student target is the first available block, while the teacher
-    target is the last single-stream block. A pure-single student capture still
-    contains the leading text tokens, so the returned boolean tells the trainer
-    to remove that prefix before applying the projector/loss.
+    Depths are global across double blocks followed by single blocks. Explicit
+    indices override the paper's scale-independent defaults (0.3D student,
+    0.7D teacher). The returned booleans tell the trainer whether each captured
+    sequence contains the leading text-token prefix.
     """
     student_double = list(student.double_blocks)
     student_single = list(student.single_blocks)
+    teacher_double = list(teacher.double_blocks)
     teacher_single = list(teacher.single_blocks)
-    if not teacher_single:
-        raise ValueError("Self-Flow requires at least one teacher single-stream block")
+    total_depth = len(student_double) + len(student_single)
+    if total_depth < 2 or total_depth != len(teacher_double) + len(teacher_single):
+        raise ValueError("Self-Flow requires matching student/teacher depths of at least two")
 
-    if student_double:
-        index = 0 if student_depth < 0 else student_depth
-        if not -len(student_double) <= index < len(student_double):
-            raise ValueError(
-                f"student_depth={student_depth} is out of range for "
-                f"{len(student_double)} double-stream blocks"
-            )
-        student_capture = FeatureCapture(stream="img_double")
-        student_capture.attach(student_double[index])
-        student_has_text_prefix = False
-    else:
-        if not student_single:
-            raise ValueError("Self-Flow requires at least one student transformer block")
-        index = 0 if student_depth < 0 else student_depth
-        if not -len(student_single) <= index < len(student_single):
-            raise ValueError(
-                f"student_depth={student_depth} is out of range for "
-                f"{len(student_single)} single-stream blocks"
-            )
-        student_capture = FeatureCapture(stream="all")
-        student_capture.attach(student_single[index])
-        student_has_text_prefix = True
+    def resolve_depth(explicit: int | None, ratio: float, label: str) -> int:
+        if explicit is not None:
+            index = explicit if explicit >= 0 else total_depth + explicit
+        else:
+            if not 0.0 <= ratio <= 1.0:
+                raise ValueError(f"{label}_depth_ratio must be in [0,1], got {ratio}")
+            index = min(total_depth - 1, int(ratio * total_depth))
+        if not 0 <= index < total_depth:
+            raise ValueError(f"{label}_depth={explicit} resolves to {index}, depth={total_depth}")
+        return index
 
-    teacher_index = -1 if teacher_depth < 0 else teacher_depth
-    if not -len(teacher_single) <= teacher_index < len(teacher_single):
+    student_index = resolve_depth(student_depth, student_depth_ratio, "student")
+    teacher_index = resolve_depth(teacher_depth, teacher_depth_ratio, "teacher")
+    if student_index >= teacher_index:
         raise ValueError(
-            f"teacher_depth={teacher_depth} is out of range for "
-            f"{len(teacher_single)} single-stream blocks"
+            f"Self-Flow requires student depth < teacher depth, got "
+            f"{student_index} >= {teacher_index}"
         )
-    teacher_capture = FeatureCapture(stream="all")
-    teacher_capture.attach(teacher_single[teacher_index])
-    return student_capture, teacher_capture, student_has_text_prefix
+
+    def attach_at_depth(double_blocks, single_blocks, index):
+        if index < len(double_blocks):
+            capture = FeatureCapture(stream="img_double")
+            capture.attach(double_blocks[index])
+            has_text_prefix = False
+        else:
+            capture = FeatureCapture(stream="all")
+            capture.attach(single_blocks[index - len(double_blocks)])
+            has_text_prefix = True
+        capture.global_depth = index
+        return capture, has_text_prefix
+
+    student_capture, student_has_text_prefix = attach_at_depth(
+        student_double, student_single, student_index,
+    )
+    teacher_capture, teacher_has_text_prefix = attach_at_depth(
+        teacher_double, teacher_single, teacher_index,
+    )
+    return (
+        student_capture,
+        teacher_capture,
+        student_has_text_prefix,
+        teacher_has_text_prefix,
+    )
 
 
 def build_self_flow_latents_continuous(
     clean: torch.Tensor, noise: torch.Tensor, t: torch.Tensor,
-    mask_ratio: float = 0.5, ratio: float = 0.5, patch_size: int = 2,
-    timestep_mode: str = "ratio",
+    mask_ratio: float = 0.25, ratio: float = 0.5, patch_size: int = 2,
+    timestep_mode: str = "independent", paired_t: torch.Tensor | None = None,
 ):
     """Continuous-t self-flow with per-token timestep mixing (UniWorld train.py:297-438 ported).
 
@@ -141,21 +156,29 @@ def build_self_flow_latents_continuous(
     - teacher_latents: interpolate(clean, noise, teacher_t) (cleaner, for EMA teacher fwd).
     - teacher_t: (B,) scalar teacher timestep.
 
-    timestep_mode: "ratio" (paired_t = t*ratio), "random_cleaner" (paired_t = t*U(0,1)),
-                   "min" (paired_t ~ U(0,1), teacher_t = min(t, paired_t)).
+    timestep_mode: "independent" samples t and s independently from the same
+                   caller-provided training distribution and uses min(t,s) for
+                   the teacher. The other modes are retained as explicit ablations.
     """
     b, c, h, w = clean.shape
     from .flow import interpolate
 
     # --- timestep pairing (UniWorld train.py:297-312, continuous t) ---
-    if timestep_mode == "ratio":
+    if timestep_mode == "independent":
+        if paired_t is None:
+            raise ValueError("independent Self-Flow requires a caller-sampled paired_t")
+        if paired_t.shape != t.shape:
+            raise ValueError(f"paired_t shape {paired_t.shape} must match t shape {t.shape}")
+        paired_t = paired_t.to(device=t.device, dtype=t.dtype).clamp(0.0, 1.0)
+        teacher_t = torch.minimum(t, paired_t)
+    elif timestep_mode == "ratio":
         paired_t = (t * ratio).clamp(0.0, 1.0)
         teacher_t = paired_t
     elif timestep_mode == "random_cleaner":
         paired_t = (t * torch.rand_like(t)).clamp(0.0, 1.0)
         teacher_t = paired_t
     elif timestep_mode == "min":
-        paired_t = torch.rand_like(t)
+        paired_t = torch.rand_like(t) if paired_t is None else paired_t
         teacher_t = torch.minimum(t, paired_t)
     else:
         raise ValueError(f"unknown timestep_mode: {timestep_mode}")

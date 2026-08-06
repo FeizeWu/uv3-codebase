@@ -149,6 +149,20 @@ if cfg.train.pad_text_to_max_length:
 if cfg.model.num_double_layers != 0 or cfg.model.num_single_layers != 30:
     errors.append(f"layers={cfg.model.num_double_layers}+{cfg.model.num_single_layers}")
 if not cfg.model.self_flow.enabled: errors.append("Self-Flow is disabled")
+sf = cfg.model.self_flow
+if sf.timestep_mode != "independent": errors.append(f"self_flow.timestep_mode={sf.timestep_mode!r}")
+if sf.mask_ratio != 0.25: errors.append(f"self_flow.mask_ratio={sf.mask_ratio!r}")
+if sf.coeff != 0.8: errors.append(f"self_flow.coeff={sf.coeff!r}")
+if sf.student_depth_ratio != 0.3 or sf.teacher_depth_ratio != 0.7:
+    errors.append(
+        f"self_flow.depth_ratios={sf.student_depth_ratio!r}->{sf.teacher_depth_ratio!r}"
+    )
+if cfg.train.timestep_strategy != "logit_normal_shift" or cfg.train.timestep_shift != 4.63:
+    errors.append(
+        f"timestep={cfg.train.timestep_strategy!r}/shift={cfg.train.timestep_shift!r}"
+    )
+if cfg.train.compile_vae and cfg.train.vae_compile_mode != "max-autotune-no-cudagraphs":
+    errors.append(f"unsafe vae_compile_mode={cfg.train.vae_compile_mode!r}")
 if cfg.train.num_shard != 8: errors.append(f"num_shard={cfg.train.num_shard!r}")
 if not cfg.train.fsdp2: errors.append("FSDP2 is disabled")
 if errors:

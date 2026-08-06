@@ -19,13 +19,13 @@ model:
   transformer: {backend: random, trainable: true}
   self_flow:
     enabled: true
-    coeff: 1.0
+    coeff: 0.8
     ema_decay: 0.9999
-    student_depth: 0
-    teacher_depth: -1
-    mask_ratio: 0.5
-    ratio: 0.5
-    timestep_mode: ratio
+    # Scale the paper's layer selection to this 30-layer 3.86B model: 9 -> 21.
+    student_depth_ratio: 0.3
+    teacher_depth_ratio: 0.7
+    mask_ratio: 0.25
+    timestep_mode: independent
 data:
   dataset: tar
   # Shard-level split; eval-v1 holdout shards are never read by training.
@@ -55,7 +55,9 @@ train:
   compile_text_encoder: true
   text_encoder_compile_mode: default
   compile_vae: true
-  vae_compile_mode: max-autotune
+  # Multiple HxW graphs are safe, but CUDA Graph capture is not: the previous
+  # resume crashed inside cudagraph_trees on the first landscape batch.
+  vae_compile_mode: max-autotune-no-cudagraphs
   compile_dynamic: false
   compile_mode: default
   text_length_buckets: [512, 640, 768, 896, 1024]
@@ -77,9 +79,11 @@ train:
   wandb: false
   log_every: 10
   seed: 42
-  timestep_strategy: logit_normal
+  # FLUX.2 Self-Flow image setting: both t and s independently use this p(t).
+  timestep_strategy: logit_normal_shift
   timestep_logit_mean: 0.0
   timestep_logit_std: 1.0
+  timestep_shift: 4.63
   timestep_metrics: true
   optimizer:
     optimizer: adamw

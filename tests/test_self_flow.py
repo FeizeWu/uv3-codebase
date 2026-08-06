@@ -62,10 +62,11 @@ def test_pure_single_self_flow_capture():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     student = _make_model(dev, double_layers=0, single_layers=2)
     teacher = copy.deepcopy(student).eval()
-    student_cap, teacher_cap, student_has_text = attach_self_flow_feature_captures(
+    student_cap, teacher_cap, student_has_text, teacher_has_text = attach_self_flow_feature_captures(
         student, teacher, student_depth=0, teacher_depth=-1,
     )
     assert student_has_text
+    assert teacher_has_text
 
     batch, n_txt = 2, 8
     noisy = torch.randn(batch, 32, 16, 16, device=dev)
@@ -80,6 +81,21 @@ def test_pure_single_self_flow_capture():
     student_img = student_cap.features[:, n_txt:]
     teacher_img = teacher_cap.features[:, n_txt:]
     assert student_img.shape == teacher_img.shape == (batch, n_img, 256)
+    student_cap.detach()
+    teacher_cap.detach()
+
+
+def test_depth_ratios_scale_to_model_depth():
+    """Paper ratios select global 0.3D -> 0.7D layers, not fixed small-model IDs."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    student = _make_model(dev, double_layers=2, single_layers=8)
+    teacher = copy.deepcopy(student).eval()
+    student_cap, teacher_cap, student_has_text, teacher_has_text = (
+        attach_self_flow_feature_captures(student, teacher)
+    )
+    assert student_cap.global_depth == 3
+    assert teacher_cap.global_depth == 7
+    assert student_has_text and teacher_has_text
     student_cap.detach()
     teacher_cap.detach()
 
@@ -144,6 +160,24 @@ def test_mask_ratio_zero_returns_student_full():
     assert tt_diff < 1e-6, f"token_timesteps should all be t when mask_ratio=0"
 
 
+def test_independent_timesteps_use_min_for_teacher():
+    """Self-Flow's second timestep comes from the same external p(t), independently."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    clean = torch.randn(2, 32, 16, 16, device=dev)
+    noise = torch.randn_like(clean)
+    t = torch.tensor([0.8, 0.2], device=dev)
+    paired_t = torch.tensor([0.3, 0.7], device=dev)
+    _, _, teacher_t, token_t = build_self_flow_latents_continuous(
+        clean, noise, t, mask_ratio=0.25, timestep_mode="independent",
+        paired_t=paired_t,
+    )
+    torch.testing.assert_close(teacher_t, torch.tensor([0.3, 0.2], device=dev))
+    for row, allowed in zip(token_t, ((0.8, 0.3), (0.2, 0.7))):
+        first = torch.full_like(row, allowed[0])
+        second = torch.full_like(row, allowed[1])
+        assert torch.logical_or(torch.isclose(row, first), torch.isclose(row, second)).all()
+
+
 def test_it2i_ref_zero_timestep():
     """it2i with ref: ref segment token_timesteps=0, forward doesn't crash, shape correct."""
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -165,12 +199,16 @@ if __name__ == "__main__":
     print("  ✓ EMA update on ordinary parameter views")
     test_pure_single_self_flow_capture()
     print("  ✓ pure-single Self-Flow capture")
+    test_depth_ratios_scale_to_model_depth()
+    print("  ✓ depth ratios scale to global model depth")
     test_equivalence_scalar_vs_per_token()
     print("  ✓ equivalence (forward_per_token == transformer.forward)")
     test_token_timesteps_none_zero_regression()
     print("  ✓ token_timesteps=None zero regression")
     test_mask_ratio_zero_returns_student_full()
     print("  ✓ mask_ratio=0 returns student_full")
+    test_independent_timesteps_use_min_for_teacher()
+    print("  ✓ independent timesteps and min teacher")
     test_it2i_ref_zero_timestep()
     print("  ✓ it2i ref with per-token timestep")
     print("test_self_flow: ALL PASS")

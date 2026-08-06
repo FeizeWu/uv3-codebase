@@ -90,12 +90,22 @@ def _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank):
         qwen.language_model.compile(dynamic=False, mode=text_compile_mode)
     compile_vae = bool(getattr(cfg.train, "compile_vae", False))
     if compile_vae:
+        vae_compile_mode = str(getattr(cfg.train, "vae_compile_mode", "default"))
+        if resolution_bucket_count > 1 and vae_compile_mode in {
+            "max-autotune", "reduce-overhead",
+        }:
+            raise ValueError(
+                f"vae_compile_mode={vae_compile_mode!r} enables CUDA Graphs, which "
+                "is unsafe with multiple resolution buckets; use "
+                "'max-autotune-no-cudagraphs' or disable compile_vae"
+            )
         # AutoencoderKLFlux2.encode() is decorated and wraps its tensor result in
-        # a posterior object. Compile the fixed-shape tensor-only core instead.
+        # a posterior object. Compile the tensor-only core instead. Each configured
+        # resolution remains a separate static graph; CUDA Graphs stay disabled.
         vae.vae._encode = torch.compile(
             vae.vae._encode,
             dynamic=False,
-            mode=str(getattr(cfg.train, "vae_compile_mode", "default")),
+            mode=vae_compile_mode,
         )
     if rank == 0:
         print(f"[train] torch.compile ON: mmdit=True teacher={teacher is not None} "
@@ -121,6 +131,27 @@ def _attention_mask(mmdit, text_valid, n_img, block_size, device):
     additive = torch.zeros(bs, 1, 1, n_txt + n_img, device=device, dtype=mmdit.dtype)
     additive.masked_fill_(~valid[:, None, None, :], torch.finfo(mmdit.dtype).min)
     return additive
+
+
+def format_resolution_bucket_loss(reduced, aspect_buckets, sf_enabled, sf_coeff):
+    """Convert globally reduced [count, FM sum, SF sum] tensors to JSON metrics."""
+    counts, fm_sums, sf_sums = reduced
+    safe_counts = counts.clamp_min(1.0)
+    fm_loss = fm_sums / safe_counts
+    sf_loss = sf_sums / safe_counts
+    total_loss = fm_loss + (float(sf_coeff) * sf_loss if sf_enabled else 0.0)
+    return {
+        "names": [bucket.name for bucket in aspect_buckets],
+        "width": [int(bucket.width) for bucket in aspect_buckets],
+        "height": [int(bucket.height) for bucket in aspect_buckets],
+        "image_tokens": [int(bucket.image_tokens) for bucket in aspect_buckets],
+        "count": [int(value) for value in counts.tolist()],
+        "fm_loss": [float(value) for value in fm_loss.tolist()],
+        "self_flow_loss": (
+            [float(value) for value in sf_loss.tolist()] if sf_enabled else None
+        ),
+        "total_loss": [float(value) for value in total_loss.tolist()],
+    }
 
 
 def _reshard_fsdp2_modules_(model: nn.Module) -> None:
@@ -832,6 +863,7 @@ def train(cfg: ExperimentConfig):
     sf_enabled = bool(getattr(sf_cfg, "enabled", False)) if sf_cfg else False
     teacher = projector = student_cap = teacher_cap = None
     sf_student_has_text_prefix = False
+    sf_teacher_has_text_prefix = False
     sf_coeff = 0.0
     sf_decay = 0.99
     sf_n_txt = 64
@@ -850,17 +882,30 @@ def train(cfg: ExperimentConfig):
         sf_mask_ratio = float(getattr(sf_cfg, "mask_ratio", 0.5))
         sf_ratio = float(getattr(sf_cfg, "ratio", 0.5))
         sf_timestep_mode = str(getattr(sf_cfg, "timestep_mode", "ratio"))
-        student_cap, teacher_cap, sf_student_has_text_prefix = (
+        (
+            student_cap,
+            teacher_cap,
+            sf_student_has_text_prefix,
+            sf_teacher_has_text_prefix,
+        ) = (
             attach_self_flow_feature_captures(
                 mmdit,
                 teacher,
-                student_depth=int(getattr(sf_cfg, "student_depth", -1)),
-                teacher_depth=int(getattr(sf_cfg, "teacher_depth", -1)),
+                student_depth=getattr(sf_cfg, "student_depth", None),
+                teacher_depth=getattr(sf_cfg, "teacher_depth", None),
+                student_depth_ratio=float(
+                    getattr(sf_cfg, "student_depth_ratio", 0.3)
+                ),
+                teacher_depth_ratio=float(
+                    getattr(sf_cfg, "teacher_depth_ratio", 0.7)
+                ),
             )
         )
         if rank == 0:
             print(f"[train] self-flow enabled coeff={sf_coeff} ema_decay={sf_decay} "
-                  f"mask_ratio={sf_mask_ratio} mode={sf_timestep_mode}", flush=True)
+                  f"mask_ratio={sf_mask_ratio} mode={sf_timestep_mode} "
+                  f"student_depth={student_cap.global_depth} "
+                  f"teacher_depth={teacher_cap.global_depth}", flush=True)
 
     # Model/projector initialization must match on every rank, while training
     # noise and timestep draws must not be identical across data-parallel ranks.
@@ -1133,6 +1178,14 @@ def train(cfg: ExperimentConfig):
     timestep_bin_counts = torch.zeros(10, device=dev, dtype=torch.float64)
     timestep_bin_fm_sums = torch.zeros_like(timestep_bin_counts)
     timestep_bin_sf_sums = torch.zeros_like(timestep_bin_counts)
+    resolution_index = {
+        bucket.name: index for index, bucket in enumerate(aspect_buckets)
+    }
+    resolution_loss_counts = torch.zeros(
+        len(aspect_buckets), device=dev, dtype=torch.float64,
+    )
+    resolution_fm_sums = torch.zeros_like(resolution_loss_counts)
+    resolution_sf_sums = torch.zeros_like(resolution_loss_counts)
     profile_start = int(os.environ.get("UV3_PROFILE_START", "-1"))
     profile_steps = int(os.environ.get("UV3_PROFILE_STEPS", "0"))
     profile_totals: dict[str, float] = {}
@@ -1269,10 +1322,26 @@ def train(cfg: ExperimentConfig):
         target_v = velocity_target(latents, noise).float()
         sf_loss_per_sample = None
         if sf_enabled:
+            paired_t = None
+            if sf_timestep_mode == "independent":
+                paired_t = sample_timesteps(
+                    bs,
+                    dev,
+                    strategy=cfg.train.timestep_strategy,
+                    image_seq_len=n_img,
+                    shift=cfg.train.timestep_shift,
+                    logit_mean=cfg.train.timestep_logit_mean,
+                    logit_std=cfg.train.timestep_logit_std,
+                    base_seq_len=cfg.train.timestep_base_seq_len,
+                    max_seq_len=cfg.train.timestep_max_seq_len,
+                    base_shift=cfg.train.timestep_base_shift,
+                    max_shift=cfg.train.timestep_max_shift,
+                )
             # per-token self-flow: mixed student latents + per-token timesteps
             student_latents, teach_lat, t_teach, token_t = build_self_flow_latents_continuous(
                 latents, noise, t,
                 mask_ratio=sf_mask_ratio, ratio=sf_ratio, timestep_mode=sf_timestep_mode,
+                paired_t=paired_t,
             )
             # Student capture is an image-only double stream, or a full
             # [text, image] sequence when the architecture is pure-single.
@@ -1288,7 +1357,7 @@ def train(cfg: ExperimentConfig):
             t_feat = teacher_cap.features
             n_txt_actual = text.shape[1]
             s_feat_img = s_feat[:, n_txt_actual:] if sf_student_has_text_prefix else s_feat
-            t_feat_img = t_feat[:, n_txt_actual:]
+            t_feat_img = t_feat[:, n_txt_actual:] if sf_teacher_has_text_prefix else t_feat
             n_tok = min(s_feat_img.shape[1], t_feat_img.shape[1])
             proj_s = projector(s_feat_img[:, :n_tok])
             teacher_norm = F.normalize(t_feat_img[:, :n_tok].float().detach(), dim=-1)
@@ -1303,6 +1372,12 @@ def train(cfg: ExperimentConfig):
             fm_loss_per_sample = (pred_v.float() - target_v).square().flatten(1).mean(1)
             loss = fm_loss_per_sample.mean()
             profile_mark("student_forward_and_fm_loss")
+        if resolution_index:
+            resolution_idx = resolution_index[resolution_name]
+            resolution_loss_counts[resolution_idx] += fm_loss_per_sample.numel()
+            resolution_fm_sums[resolution_idx] += fm_loss_per_sample.detach().double().sum()
+            if sf_loss_per_sample is not None:
+                resolution_sf_sums[resolution_idx] += sf_loss_per_sample.detach().double().sum()
         if timestep_metrics:
             bin_counts, bin_fm, bin_sf = timestep_bin_sums(
                 t, fm_loss_per_sample, sf_loss_per_sample,
@@ -1364,6 +1439,9 @@ def train(cfg: ExperimentConfig):
             bucket_counts = {}
             resolution_bucket_counts = {}
             joint_bucket_counts = {}
+            resolution_loss_counts.zero_()
+            resolution_fm_sums.zero_()
+            resolution_sf_sums.zero_()
             online_promoted_samples = 0
             online_decode_wait_seconds = 0.0
             online_buffer_peak = 0
@@ -1380,6 +1458,14 @@ def train(cfg: ExperimentConfig):
             if distributed:
                 torch.distributed.all_reduce(reduced)
             reduced_timestep_bins = reduced.cpu()
+        reduced_resolution_loss = None
+        if aspect_buckets and step % log_every == 0:
+            reduced = torch.stack(
+                [resolution_loss_counts, resolution_fm_sums, resolution_sf_sums]
+            )
+            if distributed:
+                torch.distributed.all_reduce(reduced)
+            reduced_resolution_loss = reduced.cpu()
         if rank == 0 and step % log_every == 0:
             spd = measured_steps / (time.time() - t0 + 1e-9) if measured_steps else 0.0
             ts = timer.summary()
@@ -1396,6 +1482,9 @@ def train(cfg: ExperimentConfig):
             grad_norm_stats = None
             grad_norm_str = ""
             timestep_stats = None
+            resolution_loss_stats = None
+            global_fm_loss = None
+            global_sf_loss = None
             if reduced_timestep_bins is not None:
                 counts, fm_sums, sf_sums = reduced_timestep_bins
                 safe_counts = counts.clamp_min(1.0)
@@ -1405,6 +1494,14 @@ def train(cfg: ExperimentConfig):
                     "fm_loss": (fm_sums / safe_counts).tolist(),
                     "self_flow_loss": (sf_sums / safe_counts).tolist() if sf_enabled else None,
                 }
+            if reduced_resolution_loss is not None:
+                resolution_loss_stats = format_resolution_bucket_loss(
+                    reduced_resolution_loss, aspect_buckets, sf_enabled, sf_coeff,
+                )
+                total_count = reduced_resolution_loss[0].sum().clamp_min(1.0)
+                global_fm_loss = float(reduced_resolution_loss[1].sum() / total_count)
+                if sf_enabled:
+                    global_sf_loss = float(reduced_resolution_loss[2].sum() / total_count)
             if audit_grad_norm and grad_norm_samples:
                 grad_norm_stats = {
                     "min": min(grad_norm_samples),
@@ -1448,6 +1545,9 @@ def train(cfg: ExperimentConfig):
                             "joint_bucket_counts": dict(sorted(joint_bucket_counts.items())),
                             "online_bucket": online_bucket_stats,
                             "grad_norm": grad_norm_stats,
+                            "fm_loss": global_fm_loss,
+                            "self_flow_loss": global_sf_loss,
+                            "resolution_bucket_loss": resolution_loss_stats,
                             "timestep_bins": timestep_stats}, _jf)
                 _jf.write("\n")
             timer.reset()
@@ -1462,6 +1562,10 @@ def train(cfg: ExperimentConfig):
             timestep_bin_counts.zero_()
             timestep_bin_fm_sums.zero_()
             timestep_bin_sf_sums.zero_()
+        if aspect_buckets and step % log_every == 0:
+            resolution_loss_counts.zero_()
+            resolution_fm_sums.zero_()
+            resolution_sf_sums.zero_()
         completed_steps = step + 1
         if (
             cfg.train.ckpt_every < max_steps
