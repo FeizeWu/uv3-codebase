@@ -18,7 +18,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 # Qwen3.5-4B changes the MMDiT context projection shape, so this launcher starts
 # a new run by default.  Resume must be requested explicitly with a compatible
 # checkpoint produced by this same configuration.
-RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_qwen4b_4node}"
+RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_qwen4b_4node_v2}"
 MAX_STEPS="${MAX_STEPS:-10000}"
 ALLOW_RESUME="${ALLOW_RESUME:-0}"
 RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:-0}"
@@ -204,6 +204,13 @@ else
     echo "[error] checkpoint already exists; set ALLOW_RESUME=1 only for an intentional resume: ${checkpoint}" >&2
     exit 1
   fi
+  for existing_training_file in "${output_dir}/metrics.jsonl" "${output_dir}/config.yaml"; do
+    if [[ -e "${existing_training_file}" ]]; then
+      echo "[error] fresh run would reuse an existing training directory: ${output_dir}" >&2
+      echo "[error] choose a new RUN_NAME; refusing to append fresh metrics to stale history" >&2
+      exit 1
+    fi
+  done
 fi
 
 mkdir -p "${TORCHINDUCTOR_CACHE_DIR}" "${UV3_CKPT_STAGING_DIR}"
