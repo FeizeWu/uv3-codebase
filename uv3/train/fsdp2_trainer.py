@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import random
@@ -233,6 +235,16 @@ class DataPrefetcher:
             for key in ("resolution_bucket", "image_height", "image_width"):
                 if key in batch:
                     self._next[key] = batch[key]
+            for key in (
+                "joint_token_length",
+                "bucket_promoted_samples",
+                "bucket_buffer_samples",
+                "bucket_source_samples",
+                "bucket_emitted_samples",
+                "bucket_decode_wait_seconds",
+            ):
+                if key in batch:
+                    self._next[key] = batch[key]
             if "text_bucket_length" in batch:
                 self._next["text_bucket_length"] = batch["text_bucket_length"]
             if "input_ids" in batch:
@@ -407,6 +419,267 @@ class LengthBucketBatcher:
                     "attention_mask": attention_mask,
                 })
             yield batch
+
+
+def _smooth_weighted_schedule(buckets, weights):
+    """Return a low-discrepancy period with exactly the requested integer weights."""
+    buckets = tuple(buckets)
+    weights = tuple(int(weight) for weight in weights)
+    if not buckets or len(buckets) != len(weights) or any(weight < 1 for weight in weights):
+        raise ValueError(f"invalid smooth schedule: buckets={buckets}, weights={weights}")
+    total = sum(weights)
+    scores = [0] * len(buckets)
+    schedule = []
+    for _ in range(total):
+        for index, weight in enumerate(weights):
+            scores[index] += weight
+        chosen = max(range(len(buckets)), key=lambda index: scores[index])
+        scores[chosen] -= total
+        schedule.append(buckets[chosen])
+    return tuple(schedule)
+
+
+class OnlineJointBucketBatcher:
+    """Online tokenize-once scheduler: global text/joint bucket, local aspect batch.
+
+    The source yields compact tar descriptors. Captions are tokenized in CPU
+    batches exactly once. A short caption may be promoted to a larger static
+    text bucket; within each rank all selected images share one aspect shape.
+    Tar seek/decode begins only after selection and is pipelined one or more
+    batches ahead of GPU consumption.
+    """
+
+    def __init__(
+        self,
+        loader,
+        tokenizer,
+        batch_size,
+        text_buckets,
+        text_weights,
+        resolution_buckets,
+        *,
+        tokenize_batch_size=256,
+        max_buffer_samples=8192,
+        decode_workers=4,
+        decode_prefetch_batches=2,
+        decode_fn=None,
+    ):
+        self.loader = loader
+        self.tokenizer = tokenizer
+        self.batch_size = int(batch_size)
+        self.text_buckets = tuple(int(value) for value in text_buckets)
+        self.text_weights = tuple(int(value) for value in text_weights)
+        self.resolution_buckets = tuple(resolution_buckets)
+        self.resolution_names = tuple(bucket.name for bucket in self.resolution_buckets)
+        self.max_image_tokens = max(bucket.image_tokens for bucket in self.resolution_buckets)
+        self.tokenize_batch_size = max(1, int(tokenize_batch_size))
+        self.max_buffer_samples = max(self.batch_size, int(max_buffer_samples))
+        self.decode_workers = max(1, int(decode_workers))
+        self.decode_prefetch_batches = max(1, int(decode_prefetch_batches))
+        self.decode_fn = decode_fn
+        if tuple(sorted(self.text_buckets)) != self.text_buckets:
+            raise ValueError(f"text buckets must be sorted: {self.text_buckets}")
+        if not self.resolution_buckets:
+            raise ValueError("online joint bucketing requires resolution buckets")
+        self._schedule = _smooth_weighted_schedule(self.text_buckets, self.text_weights)
+        self._schedule_cursor = 0
+        self._slot = 0
+        self._token_buffers = {}
+        self._queues = {
+            (resolution_name, text_bucket): deque()
+            for resolution_name in self.resolution_names
+            for text_bucket in self.text_buckets
+        }
+        self.source_samples = 0
+        self.emitted_samples = 0
+        self.promoted_samples = 0
+        self.peak_buffer_samples = 0
+
+    @property
+    def buffered_samples(self):
+        return sum(len(queue) for queue in self._queues.values())
+
+    def _native_text_bucket(self, length):
+        return next(
+            (bucket for bucket in self.text_buckets if length <= bucket),
+            self.text_buckets[-1],
+        )
+
+    def _tokenize_more(self, source):
+        samples = []
+        for _ in range(self.tokenize_batch_size):
+            try:
+                samples.append(next(source))
+            except StopIteration:
+                break
+        if not samples:
+            return False
+        encoded = self.tokenizer(
+            [sample["text"] for sample in samples],
+            add_special_tokens=True,
+            truncation=True,
+            max_length=self.text_buckets[-1],
+            padding=False,
+        )["input_ids"]
+        if len(encoded) != len(samples):
+            raise RuntimeError(
+                f"tokenizer returned {len(encoded)} rows for {len(samples)} captions"
+            )
+        for sample, token_ids in zip(samples, encoded):
+            resolution_name = sample.get("resolution_bucket")
+            if resolution_name not in self.resolution_names:
+                raise RuntimeError(
+                    f"dataset emitted unknown resolution bucket {resolution_name!r}; "
+                    f"expected {self.resolution_names}"
+                )
+            token_ids = list(token_ids)
+            native_bucket = self._native_text_bucket(len(token_ids))
+            sample["input_ids"] = token_ids
+            sample["native_text_bucket"] = native_bucket
+            self._queues[(resolution_name, native_bucket)].append(sample)
+        self.source_samples += len(samples)
+        buffered = self.buffered_samples
+        self.peak_buffer_samples = max(self.peak_buffer_samples, buffered)
+        if buffered > self.max_buffer_samples:
+            counts = {
+                f"{resolution}:{text}": len(queue)
+                for (resolution, text), queue in self._queues.items()
+                if queue
+            }
+            raise RuntimeError(
+                "online joint bucket descriptor buffer exceeded its hard limit; "
+                f"buffered={buffered} limit={self.max_buffer_samples} queues={counts}. "
+                "Refusing to silently drop training samples."
+            )
+        return True
+
+    def _eligible_count(self, resolution_name, target):
+        return sum(
+            len(self._queues[(resolution_name, native)])
+            for native in self.text_buckets
+            if native <= target
+        )
+
+    def _select_spec(self, source):
+        target = self._schedule[self._schedule_cursor % len(self._schedule)]
+        while True:
+            ready = [
+                resolution_name
+                for resolution_name in self.resolution_names
+                if self._eligible_count(resolution_name, target) >= self.batch_size
+            ]
+            if ready:
+                break
+            if not self._tokenize_more(source):
+                return None
+        # Prefer the aspect with the most native-fit rows, then total eligible
+        # rows. This limits padding while allowing shorter captions to backfill.
+        resolution_name = max(
+            ready,
+            key=lambda name: (
+                len(self._queues[(name, target)]),
+                self._eligible_count(name, target),
+            ),
+        )
+        selected = []
+        promoted = 0
+        for native in reversed(self.text_buckets):
+            if native > target:
+                continue
+            queue = self._queues[(resolution_name, native)]
+            take = min(self.batch_size - len(selected), len(queue))
+            for _ in range(take):
+                selected.append(queue.popleft())
+            if native < target:
+                promoted += take
+            if len(selected) == self.batch_size:
+                break
+        if len(selected) != self.batch_size:
+            raise AssertionError("eligible count and selected batch disagree")
+        self._schedule_cursor += 1
+        self.emitted_samples += self.batch_size
+        self.promoted_samples += promoted
+        return target, resolution_name, selected, promoted
+
+    def _materialize(self, spec, futures):
+        wait_start = time.perf_counter()
+        pixels = [future.result() for future in futures]
+        decode_wait = time.perf_counter() - wait_start
+        target, resolution_name, samples, promoted = spec
+        pixel_values = torch.stack(pixels)
+        pin_memory = torch.cuda.is_available()
+        slot = self._slot
+        self._slot = 1 - self._slot
+        token_key = (slot, target)
+        buffers = self._token_buffers.get(token_key)
+        if buffers is None:
+            buffers = (
+                torch.empty(
+                    (self.batch_size, target), dtype=torch.long, pin_memory=pin_memory,
+                ),
+                torch.empty(
+                    (self.batch_size, target), dtype=torch.long, pin_memory=pin_memory,
+                ),
+            )
+            self._token_buffers[token_key] = buffers
+        input_ids, attention_mask = buffers
+        input_ids.fill_(int(self.tokenizer.pad_token_id))
+        attention_mask.zero_()
+        for index, sample in enumerate(samples):
+            ids = sample["input_ids"]
+            length = len(ids)
+            input_ids[index, :length].copy_(torch.tensor(ids, dtype=torch.long))
+            attention_mask[index, :length] = 1
+        return {
+            "pixel_values": pixel_values,
+            "text": [sample["text"] for sample in samples],
+            "resolution_bucket": resolution_name,
+            "image_height": int(pixel_values.shape[-2]),
+            "image_width": int(pixel_values.shape[-1]),
+            "text_bucket_length": target,
+            "joint_token_length": target + self.max_image_tokens,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "bucket_promoted_samples": promoted,
+            "bucket_buffer_samples": self.buffered_samples,
+            "bucket_source_samples": self.source_samples,
+            "bucket_emitted_samples": self.emitted_samples,
+            "bucket_decode_wait_seconds": decode_wait,
+        }
+
+    def __iter__(self):
+        from ..data.tar_dataset import TarDescriptorDecoder
+
+        source = iter(self.loader)
+        decoder = self.decode_fn or TarDescriptorDecoder()
+        pending = deque()
+        source_done = False
+        with ThreadPoolExecutor(max_workers=self.decode_workers) as executor:
+            while True:
+                while len(pending) < self.decode_prefetch_batches and not source_done:
+                    spec = self._select_spec(source)
+                    if spec is None:
+                        source_done = True
+                        break
+                    futures = [executor.submit(decoder, sample) for sample in spec[2]]
+                    pending.append((spec, futures))
+                if not pending:
+                    return
+                spec, futures = pending.popleft()
+                yield self._materialize(spec, futures)
+
+
+def _align_text_to_joint_length(text, mask, image_tokens, image_token_budget):
+    """Append fully masked alignment slots so text+image has one global length."""
+    alignment = int(image_token_budget) - int(image_tokens)
+    if alignment < 0:
+        raise RuntimeError(
+            f"image tokens {image_tokens} exceed joint budget {image_token_budget}"
+        )
+    if alignment:
+        text = F.pad(text, (0, 0, 0, alignment))
+        mask = F.pad(mask, (0, alignment), value=0)
+    return text, mask, alignment
 
 
 def build(cfg: ExperimentConfig, dev, dtype):
@@ -706,6 +979,7 @@ def train(cfg: ExperimentConfig):
     from ..data.bucket_sampler import build_aspect_buckets
     aspect_buckets = ()
     aspect_weights = ()
+    online_joint_bucketing = False
     if bool(getattr(cfg.data, "bucket", False)):
         aspect_buckets = build_aspect_buckets(
             cfg.data.image_size,
@@ -714,23 +988,28 @@ def train(cfg: ExperimentConfig):
         )
         if not aspect_buckets:
             raise ValueError("data.bucket=true requires at least one aspect bucket")
-        configured_weights = tuple(
-            int(x) for x in getattr(cfg.data, "aspect_bucket_weights", ())
+        online_joint_bucketing = bool(
+            cfg.data.dataset == "tar"
+            and getattr(cfg.data, "online_joint_bucketing", False)
         )
-        aspect_weights = configured_weights or (1,) * len(aspect_buckets)
-        if len(aspect_weights) != len(aspect_buckets) or any(x < 1 for x in aspect_weights):
-            raise ValueError(
-                "data.aspect_bucket_weights must contain one positive integer "
-                f"per bucket: buckets={[bucket.name for bucket in aspect_buckets]} "
-                f"weights={aspect_weights}"
+        if not online_joint_bucketing:
+            configured_weights = tuple(
+                int(x) for x in getattr(cfg.data, "aspect_bucket_weights", ())
             )
+            aspect_weights = configured_weights or (1,) * len(aspect_buckets)
+            if len(aspect_weights) != len(aspect_buckets) or any(x < 1 for x in aspect_weights):
+                raise ValueError(
+                    "data.aspect_bucket_weights must contain one positive integer "
+                    f"per bucket: buckets={[bucket.name for bucket in aspect_buckets]} "
+                    f"weights={aspect_weights}"
+                )
         if rank == 0:
             print(
                 "[train] resolution buckets="
                 + ", ".join(
                     f"{bucket.name}:{bucket.width}x{bucket.height}"
-                    f"/{bucket.image_tokens}tok/w{weight}"
-                    for bucket, weight in zip(aspect_buckets, aspect_weights)
+                    f"/{bucket.image_tokens}tok"
+                    for bucket in aspect_buckets
                 ),
                 flush=True,
             )
@@ -743,6 +1022,7 @@ def train(cfg: ExperimentConfig):
             image_size=cfg.data.image_size,
             caption_field=getattr(cfg.data, "caption_field", "caption_qwen3_7_flash"),
             aspect_buckets=aspect_buckets,
+            defer_image_decode=online_joint_bucketing,
         )
         ds.set_epoch(resumed_epoch)
     elif cfg.data.dataset == "fixed_tar":
@@ -768,10 +1048,34 @@ def train(cfg: ExperimentConfig):
         ds.set_epoch(resumed_epoch)
     text_buckets = tuple(int(x) for x in getattr(cfg.train, "text_length_buckets", ()))
     pad_text_to_max = bool(getattr(cfg.train, "pad_text_to_max_length", True))
-    if text_buckets or aspect_buckets:
-        text_bucket_weights = tuple(
-            int(x) for x in getattr(cfg.train, "text_length_bucket_weights", ())
-        ) if text_buckets else ()
+    text_bucket_weights = tuple(
+        int(x) for x in getattr(cfg.train, "text_length_bucket_weights", ())
+    ) if text_buckets else ()
+    if online_joint_bucketing:
+        if not text_buckets:
+            raise ValueError("online joint bucketing requires text_length_buckets")
+        sample_loader = DataLoader(ds, batch_size=None, num_workers=cfg.data.num_workers)
+        loader = OnlineJointBucketBatcher(
+            sample_loader,
+            qwen.tokenizer,
+            cfg.train.batch_size_per_gpu,
+            text_buckets,
+            text_bucket_weights,
+            aspect_buckets,
+            tokenize_batch_size=getattr(cfg.data, "tokenize_batch_size", 256),
+            max_buffer_samples=getattr(cfg.data, "bucket_buffer_max_samples", 8192),
+            decode_workers=getattr(cfg.data, "decode_workers", cfg.data.num_workers),
+            decode_prefetch_batches=getattr(cfg.data, "decode_prefetch_batches", 2),
+        )
+        if rank == 0:
+            print(
+                f"[train] online joint bucketing ON: text={text_buckets} "
+                f"smooth_weights={text_bucket_weights} "
+                f"joint_lengths={tuple(bucket + loader.max_image_tokens for bucket in text_buckets)} "
+                "aspect=rank-local adaptive decode=after-selection drop=forbidden",
+                flush=True,
+            )
+    elif text_buckets or aspect_buckets:
         sample_loader = DataLoader(ds, batch_size=None, num_workers=cfg.data.num_workers)
         loader = LengthBucketBatcher(
             sample_loader,
@@ -819,6 +1123,12 @@ def train(cfg: ExperimentConfig):
     measured_steps = 0
     bucket_counts = {}
     resolution_bucket_counts = {}
+    joint_bucket_counts = {}
+    online_promoted_samples = 0
+    online_decode_wait_seconds = 0.0
+    online_buffer_peak = 0
+    online_source_samples = 0
+    online_emitted_samples = 0
     timestep_metrics = bool(getattr(cfg.train, "timestep_metrics", False))
     timestep_bin_counts = torch.zeros(10, device=dev, dtype=torch.float64)
     timestep_bin_fm_sums = torch.zeros_like(timestep_bin_counts)
@@ -855,6 +1165,18 @@ def train(cfg: ExperimentConfig):
             ds.set_epoch(step)
             prefetcher = DataPrefetcher(loader, dev, dtype)
             batch = prefetcher.next()
+        if online_joint_bucketing:
+            online_promoted_samples += int(batch.get("bucket_promoted_samples", 0))
+            online_decode_wait_seconds += float(batch.get("bucket_decode_wait_seconds", 0.0))
+            online_buffer_peak = max(
+                online_buffer_peak, int(batch.get("bucket_buffer_samples", 0))
+            )
+            online_source_samples = int(
+                batch.get("bucket_source_samples", online_source_samples)
+            )
+            online_emitted_samples = int(
+                batch.get("bucket_emitted_samples", online_emitted_samples)
+            )
         timer.start()
         profile_begin(step)
         with torch.no_grad():
@@ -876,6 +1198,12 @@ def train(cfg: ExperimentConfig):
                 text = F.pad(text, (0, 0, 0, pad_length))
                 mask = F.pad(mask, (0, pad_length), value=0)
             n_img = (latents.shape[-1] // 2) * (latents.shape[-2] // 2)
+            alignment_tokens = 0
+            if online_joint_bucketing:
+                joint_image_budget = max(bucket.image_tokens for bucket in aspect_buckets)
+                text, mask, alignment_tokens = _align_text_to_joint_length(
+                    text, mask, n_img, joint_image_budget,
+                )
             image_height, image_width = batch["pixel_values"].shape[-2:]
             token_stride = vae.scale_factor(max(image_height, image_width)) * cfg.model.patch_size
             if image_height % token_stride or image_width % token_stride:
@@ -884,7 +1212,10 @@ def train(cfg: ExperimentConfig):
                     f"VAE+patch stride {token_stride}"
                 )
             expected_img = (image_height // token_stride) * (image_width // token_stride)
-            expected_text = cfg.model.qwen_vl.max_length if pad_text_to_max else bucket_length
+            expected_text_base = (
+                cfg.model.qwen_vl.max_length if pad_text_to_max else bucket_length
+            )
+            expected_text = expected_text_base + alignment_tokens
             if text.shape[1] != expected_text:
                 raise RuntimeError(
                     f"static compile expects {expected_text} text tokens, "
@@ -894,6 +1225,21 @@ def train(cfg: ExperimentConfig):
                 raise RuntimeError(
                     f"static compile expects {expected_img} image tokens from "
                     f"{image_width}x{image_height}, got {n_img}"
+                )
+            if online_joint_bucketing:
+                expected_joint = expected_text_base + joint_image_budget
+                actual_joint = text.shape[1] + n_img
+                configured_joint = int(batch.get("joint_token_length", expected_joint))
+                if actual_joint != expected_joint or (
+                    not pad_text_to_max and configured_joint != expected_joint
+                ):
+                    raise RuntimeError(
+                        "joint-length alignment failed: "
+                        f"text={text.shape[1]} image={n_img} actual={actual_joint} "
+                        f"expected={expected_joint} configured={configured_joint}"
+                    )
+                joint_bucket_counts[expected_joint] = (
+                    joint_bucket_counts.get(expected_joint, 0) + 1
                 )
             resolution_name = str(
                 batch.get("resolution_bucket", f"{image_width}x{image_height}")
@@ -1017,6 +1363,10 @@ def train(cfg: ExperimentConfig):
             timer.reset()
             bucket_counts = {}
             resolution_bucket_counts = {}
+            joint_bucket_counts = {}
+            online_promoted_samples = 0
+            online_decode_wait_seconds = 0.0
+            online_buffer_peak = 0
             if rank == 0:
                 print(f"[bench] warmup complete: {bench_warmup} steps; measurement starts now", flush=True)
         elif step + 1 > start_step + bench_warmup:
@@ -1041,6 +1391,8 @@ def train(cfg: ExperimentConfig):
             )
             if aspect_buckets:
                 bucket_str += f" resolution_buckets={dict(sorted(resolution_bucket_counts.items()))}"
+            if online_joint_bucketing:
+                bucket_str += f" joint_buckets={dict(sorted(joint_bucket_counts.items()))}"
             grad_norm_stats = None
             grad_norm_str = ""
             timestep_stats = None
@@ -1066,7 +1418,23 @@ def train(cfg: ExperimentConfig):
                     f"/{grad_norm_stats['max']:.4f}"
                     f" clipped={grad_norm_stats['clip_count']}/{grad_norm_stats['count']}"
                 )
-            print(f"[train] step {step:5d} loss={loss.item():.4f} {spd:.2f}it/s mem={mem_gib:.1f}GiB({mem_pct:.1f}%){bucket_str}{grad_norm_str} [{timing_str}]", flush=True)
+            online_bucket_stats = None
+            online_bucket_str = ""
+            if online_joint_bucketing:
+                online_bucket_stats = {
+                    "promoted_samples": online_promoted_samples,
+                    "buffer_peak_samples": online_buffer_peak,
+                    "source_samples_cumulative": online_source_samples,
+                    "emitted_samples_cumulative": online_emitted_samples,
+                    "dropped_samples_cumulative": 0,
+                    "decode_wait_seconds": online_decode_wait_seconds,
+                }
+                online_bucket_str = (
+                    f" online_bucket(promote={online_promoted_samples}"
+                    f",buffer={online_buffer_peak}"
+                    f",decode_wait={online_decode_wait_seconds:.3f}s,drop=0)"
+                )
+            print(f"[train] step {step:5d} loss={loss.item():.4f} {spd:.2f}it/s mem={mem_gib:.1f}GiB({mem_pct:.1f}%){bucket_str}{online_bucket_str}{grad_norm_str} [{timing_str}]", flush=True)
             # JSONL metrics: timing_unit 自文档,说明 timing 是窗口和而非每步
             import json as _json
             with open(os.path.join(out_dir, "metrics.jsonl"), "a") as _jf:
@@ -1077,12 +1445,18 @@ def train(cfg: ExperimentConfig):
                             "timing": ts, "timing_unit": f"sum_over_{log_every}_steps",
                             "text_bucket_counts": dict(sorted(bucket_counts.items())),
                             "resolution_bucket_counts": dict(sorted(resolution_bucket_counts.items())),
+                            "joint_bucket_counts": dict(sorted(joint_bucket_counts.items())),
+                            "online_bucket": online_bucket_stats,
                             "grad_norm": grad_norm_stats,
                             "timestep_bins": timestep_stats}, _jf)
                 _jf.write("\n")
             timer.reset()
             bucket_counts = {}
             resolution_bucket_counts = {}
+            joint_bucket_counts = {}
+            online_promoted_samples = 0
+            online_decode_wait_seconds = 0.0
+            online_buffer_peak = 0
             grad_norm_samples = []
         if timestep_metrics and step % log_every == 0:
             timestep_bin_counts.zero_()

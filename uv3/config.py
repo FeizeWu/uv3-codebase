@@ -78,6 +78,15 @@ class DataConfig:
     )
     aspect_bucket_weights: tuple[int, ...] = ()
     resolution_stride: int = 16
+    # Online one-pass joint bucketing: tokenize metadata in batches, select a
+    # compact descriptor batch, then asynchronously seek/decode only that batch.
+    # Opt in per production config so historical benchmark configs keep their
+    # original data path and remain directly comparable.
+    online_joint_bucketing: bool = False
+    tokenize_batch_size: int = 256
+    bucket_buffer_max_samples: int = 8192
+    decode_workers: int = 4
+    decode_prefetch_batches: int = 2
     alpha: bool = True                     # preserve RGBA else pad ones
     it2i_mix: float = 0.0                  # 0 = pure t2i; >0 = fraction of edit pairs
     it2i_parquet: str | None = None

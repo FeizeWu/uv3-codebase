@@ -32,12 +32,16 @@ data:
   root: /mnt/oss/uv3-pretrain-manifect/0803-test/eval-v1/train_manifest.jsonl
   image_size: 256
   # Keep roughly 256^2 pixels while preserving common source aspect ratios.
-  # Weights are percentages from a 432,687-row sample of this manifest
-  # (2026-08-06); matching the source distribution bounds queue growth.
+  # Aspect is selected rank-locally; only the five text+260 joint lengths are
+  # globally scheduled, so no independence assumption or aspect weights remain.
   bucket: true
   aspect_buckets: [square, landscape, portrait, widescreen, phone]
-  aspect_bucket_weights: [19, 37, 14, 26, 4]
   resolution_stride: 16
+  online_joint_bucketing: true
+  tokenize_batch_size: 256
+  bucket_buffer_max_samples: 8192
+  decode_workers: 4
+  decode_prefetch_batches: 2
   caption_field: caption_qwen3_7_flash
   num_workers: 4
 train:
@@ -55,7 +59,9 @@ train:
   compile_dynamic: false
   compile_mode: default
   text_length_buckets: [512, 640, 768, 896, 1024]
-  text_length_bucket_weights: [5, 4, 4, 3, 4]
+  # Smooth feasible allocation for the measured cumulative caption-length
+  # distribution. Short captions may be promoted to a larger bucket.
+  text_length_bucket_weights: [23, 21, 20, 15, 21]
   pad_text_to_max_length: false
   flex_attention: true
   block_size: 128

@@ -1,4 +1,8 @@
-from uv3.data.tar_dataset import partition_shard_indices
+import io
+
+from PIL import Image
+
+from uv3.data.tar_dataset import TarDescriptorDecoder, partition_shard_indices
 
 
 def test_shard_partition_is_disjoint_and_complete_for_four_nodes():
@@ -20,3 +24,20 @@ def test_shard_partition_is_deterministic_per_epoch():
     changed = partition_shard_indices(1_000, 0, True, 4, 11, 128)
     assert first == second
     assert first != changed
+
+
+def test_deferred_tar_descriptor_decodes_selected_shape(tmp_path):
+    image = Image.new("RGB", (80, 40), (20, 40, 60))
+    encoded = io.BytesIO()
+    image.save(encoded, format="PNG")
+    prefix = b"descriptor-prefix"
+    path = tmp_path / "images.tar"
+    path.write_bytes(prefix + encoded.getvalue())
+    pixels = TarDescriptorDecoder()({
+        "image_tar": str(path),
+        "offset": len(prefix),
+        "size": len(encoded.getvalue()),
+        "image_height": 32,
+        "image_width": 48,
+    })
+    assert pixels.shape == (3, 32, 48)

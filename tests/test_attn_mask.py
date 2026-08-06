@@ -9,6 +9,7 @@ import torch
 
 from uv3.config import ModelConfig, ComponentConfig, SelfFlowConfig
 from uv3.modeling.mmdit import MMDiT
+from uv3.train.fsdp2_trainer import _align_text_to_joint_length, _attention_mask
 
 
 def _make_model(dev, dtype=torch.float32):
@@ -96,6 +97,33 @@ def test_padded_batch_vs_truncated():
     # Tighten the old 0.1 tolerance: masked padding and a truly shorter text
     # sequence must be equivalent at the same numerical tolerance.
     assert diff_0 < 2e-3, f"padded sample 0 should match truncated: diff={diff_0}"
+
+
+def test_joint_length_alignment_padding_is_numerically_inert():
+    """Resolution-alignment slots are masked and cannot change image output."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    m = _make_model(dev, dtype=torch.float32)
+    m.eval()
+    noisy = torch.randn(1, 32, 32, 32, device=dev)
+    text = torch.randn(1, 8, 256, device=dev)
+    text_valid = torch.ones(1, 8, dtype=torch.long, device=dev)
+    t = torch.tensor([0.5], device=dev)
+    n_img = (noisy.shape[-2] // 2) * (noisy.shape[-1] // 2)
+
+    aligned_text, aligned_valid, alignment = _align_text_to_joint_length(
+        text, text_valid, image_tokens=n_img, image_token_budget=n_img + 4,
+    )
+    aligned_mask = _attention_mask(m, aligned_valid, n_img, 128, dev)
+
+    with torch.no_grad():
+        baseline = m.predict_velocity(noisy, text, t)
+        aligned = m.predict_velocity(
+            noisy, aligned_text, t, text_attn_mask=aligned_mask,
+        )
+
+    diff = (baseline - aligned).abs().max().item()
+    assert alignment == 4
+    assert diff < 1e-5, f"masked alignment slots changed output: diff={diff}"
 
 
 if __name__ == "__main__":

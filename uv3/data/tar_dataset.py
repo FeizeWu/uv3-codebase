@@ -5,15 +5,16 @@ Reads: manifest jsonl → metadata parquet (shard_key/filename/offset/size/capti
 Filters: caption non-null (~11% drop).
 Shuffle: block-level (inter-shard), in-block by offset (tar-friendly sequential read).
 Resume: data_status=(shard_pos, row_pos) row-level, stored in ckpt.
-Bucketing: aspect hard bucket + caption-length binning within bucket (same bin = same batch).
+Bucketing: optionally emit compact descriptors for online joint text/aspect scheduling;
+           selected descriptors are decoded later in a bounded thread pool.
 """
 from __future__ import annotations
 
 import io
 import json
 import random
+import threading
 from collections import OrderedDict
-from pathlib import Path
 
 import pyarrow.parquet as pq
 import torch
@@ -64,6 +65,7 @@ class TarMetadataDataset(IterableDataset):
         caption_field: str = CAPTION_FIELD,
         shuffle: bool = True,
         aspect_buckets: tuple[AspectBucket, ...] = (),
+        defer_image_decode: bool = False,
     ):
         super().__init__()
         self.manifest_path = manifest_path
@@ -71,6 +73,7 @@ class TarMetadataDataset(IterableDataset):
         self.caption_field = caption_field
         self.shuffle = shuffle
         self.aspect_buckets = tuple(aspect_buckets)
+        self.defer_image_decode = bool(defer_image_decode)
         self._entries = _load_manifest(manifest_path)
         self._epoch = 0
         self._resume_shard = 0
@@ -134,6 +137,36 @@ class TarMetadataDataset(IterableDataset):
                 for ri, row in enumerate(rows):
                     if ri < skip:
                         continue
+                    source_width = int(row.get("width") or 0)
+                    source_height = int(row.get("height") or 0)
+                    if self.defer_image_decode and (source_width <= 0 or source_height <= 0):
+                        continue
+                    if self.aspect_buckets and source_width > 0 and source_height > 0:
+                        bucket = choose_aspect_bucket(
+                            source_width, source_height, self.aspect_buckets,
+                        )
+                    else:
+                        bucket = AspectBucket(
+                            name="square",
+                            width=self.image_size,
+                            height=self.image_size,
+                        )
+                    caption = row[self.caption_field]
+                    if self.defer_image_decode:
+                        # Keep the online bucket queue compact: no decoded tensor,
+                        # shared-memory storage, or open tar descriptor is retained.
+                        yield {
+                            "text": caption,
+                            "resolution_bucket": bucket.name,
+                            "image_height": bucket.height,
+                            "image_width": bucket.width,
+                            "image_tar": image_tar,
+                            "offset": int(row["offset"]),
+                            "size": int(row["size"]),
+                            "shard_pos": si_global,
+                            "row_pos": ri,
+                        }
+                        continue
                     # read image from tar (byte-range via seek)
                     try:
                         if image_tar not in tar_cache:
@@ -147,23 +180,16 @@ class TarMetadataDataset(IterableDataset):
                         fh.seek(row["offset"])
                         raw = fh.read(row["size"])
                         img = Image.open(io.BytesIO(raw)).convert("RGB")
-                        source_width = int(row.get("width") or img.width)
-                        source_height = int(row.get("height") or img.height)
-                        if self.aspect_buckets:
+                        source_width = source_width or img.width
+                        source_height = source_height or img.height
+                        if self.aspect_buckets and (source_width, source_height) != (0, 0):
                             bucket = choose_aspect_bucket(
                                 source_width, source_height, self.aspect_buckets,
-                            )
-                        else:
-                            bucket = AspectBucket(
-                                name="square",
-                                width=self.image_size,
-                                height=self.image_size,
                             )
                         arr = pil_to_tensor(img, (bucket.height, bucket.width))
                     except Exception:
                         continue
 
-                    caption = row[self.caption_field]
                     yield {
                         "pixel_values": arr,
                         "text": caption,
@@ -179,3 +205,37 @@ class TarMetadataDataset(IterableDataset):
                 fh.close()
             except Exception:
                 pass
+
+
+class TarDescriptorDecoder:
+    """Thread-safe callable that decodes selected descriptors with per-thread LRU handles."""
+
+    def __init__(self, max_open_tars_per_thread: int = 16):
+        self.max_open_tars_per_thread = max(1, int(max_open_tars_per_thread))
+        self._local = threading.local()
+
+    def _cache(self) -> OrderedDict:
+        cache = getattr(self._local, "tar_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._local.tar_cache = cache
+        return cache
+
+    def __call__(self, sample: dict) -> torch.Tensor:
+        cache = self._cache()
+        image_tar = sample["image_tar"]
+        if image_tar not in cache:
+            if len(cache) >= self.max_open_tars_per_thread:
+                _, old_handle = cache.popitem(last=False)
+                old_handle.close()
+            cache[image_tar] = open(image_tar, "rb")
+        else:
+            cache.move_to_end(image_tar)
+        handle = cache[image_tar]
+        handle.seek(int(sample["offset"]))
+        raw = handle.read(int(sample["size"]))
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+        return pil_to_tensor(
+            image,
+            (int(sample["image_height"]), int(sample["image_width"])),
+        )
