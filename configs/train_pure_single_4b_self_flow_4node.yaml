@@ -40,6 +40,13 @@ data:
   online_joint_bucketing: true
   tokenize_batch_size: 256
   bucket_buffer_max_samples: 8192
+  dynamic_joint_bucket_scheduler: true
+  bucket_lookahead_per_slot: 512
+  bucket_soft_buffer_limit: 6144
+  bucket_long_term_window_per_rank: 50000
+  bucket_long_term_safety_margin: 0.02
+  bucket_telemetry_interval_steps: 100
+  bucket_diagnostic_rate_limit_steps: 1000
   decode_workers: 4
   decode_prefetch_batches: 2
   caption_field: caption_qwen3_7_flash

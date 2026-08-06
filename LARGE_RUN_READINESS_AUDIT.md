@@ -12,7 +12,7 @@
 - 首轮只直接修复了已经导致训练中断的 online joint bucket buffer 问题，并把生产默认步数改为 100K。
 - 经项目负责人批准，本轮继续修复并验证了 `P0-01`、`P0-03`、`P1-02`、`P1-03`，以及保留全部历史 checkpoint；具体证据记录在对应条目中。
 - `P0-02` 按决定暂缓；其他未经批准的审计项均未修改。
-- 当前结论：上述获批修复已达到合入条件，但这不等同于已放行正式 100K。启动前仍需明确接受暂缓的 `P0-02` 风险，并完成本文后部列出的多机 shape 矩阵和长时间 soak 门槛。
+- 当前结论：上述获批修复已达到合入条件；2026-08-07 又完成了供给驱动动态联合分桶及关键 smoke。正式 100K 启动前仍需明确接受暂缓的 `P0-02` 风险，并由提交环境完成四节点短 smoke。
 
 ## 已直接修复：联合分桶 descriptor buffer 溢出
 
@@ -39,6 +39,7 @@
 - 坏图补样在 buffer 已满时，不再继续塞入无关 descriptor；改用当前 batch 中完整有效的 image-text pair 回填并计数。
 - 生产 config 与多机 launcher 的默认 `MAX_STEPS` 改为 `100000`，launcher 拒绝小于 100K 的生产提交。
 - launcher preflight 锁定新 bucket 权重和最小 buffer。
+- 后续动态调度已取代“仅靠静态权重可行性”的最终防线：每 rank 采用有界 lookahead，所有 rank 通过独立 Gloo 控制组选取最短公共 ready text target，并在 50,000 个新 descriptor 窗口后按 worst-rank CDF 更新权重。完整设计与验收见 `DYNAMIC_JOINT_BUCKET_SCHEDULER_PLAN.md`。
 
 ### 验证证据
 

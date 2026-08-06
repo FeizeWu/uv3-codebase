@@ -9,7 +9,7 @@ model:
   patch_size: 2
   rope_theta: 2000.0
   guidance_embeds: false
-  flex_attention: false
+  flex_attention: true
   alpha_on: false
   vae: {backend: diffusers, pretrained: /mnt/data/users/wfz/checkpoints/black-forest-labs/FLUX.2-dev, subfolder: vae, trainable: false}
   qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-4B, trainable: false, max_length: 1024}
@@ -43,26 +43,27 @@ data:
   decode_workers: 2
   decode_prefetch_batches: 2
   caption_field: caption_qwen3_7_flash
-  num_workers: 4
+  num_workers: 2
 train:
   fsdp2: true
   num_replicate: 1
-  num_shard: 4
+  num_shard: 2
   reshard_after_forward: true
   mixed_precision: bf16
-  compile: false
+  compile: true
+  compile_mode: default
   text_length_buckets: [512, 640, 768, 896, 1024]
   text_length_bucket_weights: [20, 18, 18, 14, 30]
   pad_text_to_max_length: false
-  flex_attention: false
+  flex_attention: true
   block_size: 128
   batch_size_per_gpu: 2
   grad_accum: 1
-  max_steps: 4
+  max_steps: 3
   grad_clip: 1.0
-  ckpt_every: 2
+  ckpt_every: 3
   output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
-  run_name: smoke_exact_resume
+  run_name: smoke_dynamic_flex_compile
   monitor_enabled: false
   log_every: 1
   seed: 42

@@ -147,6 +147,8 @@ if tuple(cfg.data.aspect_buckets) != expected_aspects:
     errors.append(f"aspect_buckets={cfg.data.aspect_buckets!r}")
 if not cfg.data.online_joint_bucketing:
     errors.append("online_joint_bucketing is disabled")
+if not cfg.data.dynamic_joint_bucket_scheduler:
+    errors.append("dynamic_joint_bucket_scheduler is disabled")
 if tuple(cfg.train.text_length_buckets) != (512, 640, 768, 896, 1024):
     errors.append(f"text_length_buckets={cfg.train.text_length_buckets!r}")
 if tuple(cfg.train.text_length_bucket_weights) != (20, 18, 18, 14, 30):
@@ -155,6 +157,27 @@ if tuple(cfg.train.text_length_bucket_weights) != (20, 18, 18, 14, 30):
     )
 if cfg.data.bucket_buffer_max_samples < 8192:
     errors.append(f"bucket_buffer_max_samples={cfg.data.bucket_buffer_max_samples!r}")
+if cfg.data.bucket_lookahead_per_slot != 512:
+    errors.append(f"bucket_lookahead_per_slot={cfg.data.bucket_lookahead_per_slot!r}")
+if cfg.data.bucket_soft_buffer_limit != 6144:
+    errors.append(f"bucket_soft_buffer_limit={cfg.data.bucket_soft_buffer_limit!r}")
+if cfg.data.bucket_long_term_window_per_rank != 50000:
+    errors.append(
+        f"bucket_long_term_window_per_rank={cfg.data.bucket_long_term_window_per_rank!r}"
+    )
+if cfg.data.bucket_long_term_safety_margin != 0.02:
+    errors.append(
+        f"bucket_long_term_safety_margin={cfg.data.bucket_long_term_safety_margin!r}"
+    )
+if cfg.data.bucket_telemetry_interval_steps != 100:
+    errors.append(
+        f"bucket_telemetry_interval_steps={cfg.data.bucket_telemetry_interval_steps!r}"
+    )
+if cfg.data.bucket_diagnostic_rate_limit_steps != 1000:
+    errors.append(
+        "bucket_diagnostic_rate_limit_steps="
+        f"{cfg.data.bucket_diagnostic_rate_limit_steps!r}"
+    )
 if cfg.train.pad_text_to_max_length:
     errors.append("pad_text_to_max_length must be false for joint buckets")
 if cfg.model.num_double_layers != 0 or cfg.model.num_single_layers != 30:
@@ -236,7 +259,7 @@ if [[ "${UV3_MONITOR}" == "1" ]]; then
   done
 fi
 
-code_fingerprint="$(sha256sum uv3/train/fsdp2_trainer.py uv3/train/fsdp2.py uv3/data/tar_dataset.py uv3/modeling/mmdit.py "${CONFIG}" | sha256sum | awk '{print $1}')"
+code_fingerprint="$(sha256sum uv3/config.py uv3/train/fsdp2_trainer.py uv3/train/fsdp2.py uv3/data/tar_dataset.py uv3/data/dynamic_bucket_scheduler.py uv3/modeling/mmdit.py "${CONFIG}" | sha256sum | awk '{print $1}')"
 echo "[launch] node=${NODE_RANK}/${NNODES} master=${MASTER_ADDR}:${MASTER_PORT} gpus/node=${GPUS_PER_NODE}"
 echo "[launch] python=${PYTHON_BIN} config=${CONFIG} run=${RUN_NAME} max_steps=${MAX_STEPS}"
 echo "[launch] manifest=${MANIFEST} code_fingerprint=${code_fingerprint}"

@@ -38,6 +38,12 @@ from ..modeling.self_flow import (
 )
 from ..modeling.flow import interpolate, velocity_target
 from ..data.noise_scheduler import sample_timesteps, timestep_bin_sums
+from ..data.dynamic_bucket_scheduler import (
+    DistributedBucketController,
+    DynamicJointBucketScheduler,
+    LocalBucketController,
+    smooth_weighted_schedule,
+)
 from ..optim.build_optimizers import build_optimizers
 from .fsdp2 import (
     apply_fsdp2,
@@ -321,8 +327,10 @@ class DataPrefetcher:
                 "bucket_promoted_samples",
                 "bucket_buffer_samples",
                 "bucket_source_samples",
+                "bucket_scheduled_samples",
                 "bucket_emitted_samples",
                 "bucket_decode_wait_seconds",
+                "bucket_scheduler",
             ):
                 if key in batch:
                     self._next[key] = batch[key]
@@ -522,20 +530,7 @@ class LengthBucketBatcher:
 
 def _smooth_weighted_schedule(buckets, weights):
     """Return a low-discrepancy period with exactly the requested integer weights."""
-    buckets = tuple(buckets)
-    weights = tuple(int(weight) for weight in weights)
-    if not buckets or len(buckets) != len(weights) or any(weight < 1 for weight in weights):
-        raise ValueError(f"invalid smooth schedule: buckets={buckets}, weights={weights}")
-    total = sum(weights)
-    scores = [0] * len(buckets)
-    schedule = []
-    for _ in range(total):
-        for index, weight in enumerate(weights):
-            scores[index] += weight
-        chosen = max(range(len(buckets)), key=lambda index: scores[index])
-        scores[chosen] -= total
-        schedule.append(buckets[chosen])
-    return tuple(schedule)
+    return smooth_weighted_schedule(buckets, weights)
 
 
 class OnlineJointBucketBatcher:
@@ -562,6 +557,12 @@ class OnlineJointBucketBatcher:
         decode_workers=4,
         decode_prefetch_batches=2,
         decode_fn=None,
+        dynamic_scheduler=False,
+        bucket_controller=None,
+        lookahead_per_slot=512,
+        soft_buffer_limit=6144,
+        long_term_window_per_rank=50_000,
+        long_term_safety_margin=0.02,
     ):
         self.loader = loader
         self.tokenizer = tokenizer
@@ -580,7 +581,39 @@ class OnlineJointBucketBatcher:
             raise ValueError(f"text buckets must be sorted: {self.text_buckets}")
         if not self.resolution_buckets:
             raise ValueError("online joint bucketing requires resolution buckets")
-        self._schedule = _smooth_weighted_schedule(self.text_buckets, self.text_weights)
+        self.dynamic_enabled = bool(dynamic_scheduler)
+        self.lookahead_per_slot = int(lookahead_per_slot)
+        self.soft_buffer_limit = int(soft_buffer_limit)
+        self.scheduler = None
+        self.bucket_controller = None
+        if self.dynamic_enabled:
+            self.scheduler = DynamicJointBucketScheduler(
+                self.text_buckets,
+                self.text_weights,
+                batch_size=self.batch_size,
+                resolution_count=len(self.resolution_names),
+                long_term_window_per_rank=long_term_window_per_rank,
+                safety_margin=long_term_safety_margin,
+            )
+            self.bucket_controller = bucket_controller or LocalBucketController()
+            minimum = self.scheduler.minimum_ready_buffer
+            if self.lookahead_per_slot < minimum:
+                raise ValueError(
+                    f"lookahead_per_slot={self.lookahead_per_slot} cannot guarantee a "
+                    f"ready resolution; minimum={minimum}"
+                )
+            if not minimum <= self.soft_buffer_limit <= self.max_buffer_samples:
+                raise ValueError(
+                    f"buffer limits must satisfy minimum={minimum} <= soft="
+                    f"{self.soft_buffer_limit} <= hard={self.max_buffer_samples}"
+                )
+        elif bucket_controller is not None:
+            raise ValueError("bucket_controller requires dynamic_scheduler=true")
+        self._schedule = (
+            self.scheduler.schedule
+            if self.scheduler is not None
+            else _smooth_weighted_schedule(self.text_buckets, self.text_weights)
+        )
         self._schedule_cursor = 0
         self._slot = 0
         self._token_buffers = {}
@@ -590,6 +623,7 @@ class OnlineJointBucketBatcher:
             for text_bucket in self.text_buckets
         }
         self.source_samples = 0
+        self.scheduled_samples = 0
         self.emitted_samples = 0
         self.promoted_samples = 0
         self.peak_buffer_samples = 0
@@ -599,7 +633,11 @@ class OnlineJointBucketBatcher:
         self.last_source_worker_id: int | None = None
         self._active_pending = None
         self._restored_pending_specs = deque()
-        minimum_pigeonhole_buffer = len(self._queues) * (self.batch_size - 1) + 1
+        minimum_pigeonhole_buffer = (
+            self.scheduler.minimum_ready_buffer
+            if self.scheduler is not None
+            else len(self._queues) * (self.batch_size - 1) + 1
+        )
         if self.max_buffer_samples < minimum_pigeonhole_buffer:
             raise ValueError(
                 "online joint bucket buffer cannot guarantee that any exact-native "
@@ -611,13 +649,21 @@ class OnlineJointBucketBatcher:
     def buffered_samples(self):
         return sum(len(queue) for queue in self._queues.values())
 
+    @staticmethod
+    def _checkpoint_spec(spec):
+        """Copy a pending spec without persisting nondeterministic timing data."""
+        saved = copy.deepcopy(spec)
+        if len(saved) == 5:
+            saved[4]["control_wait_ms"] = 0.0
+        return saved
+
     def _native_text_bucket(self, length):
         return next(
             (bucket for bucket in self.text_buckets if length <= bucket),
             self.text_buckets[-1],
         )
 
-    def _tokenize_more(self, source):
+    def _tokenize_more(self, source, max_samples=None):
         available = self.max_buffer_samples - self.buffered_samples
         if available <= 0:
             counts = {
@@ -634,7 +680,10 @@ class OnlineJointBucketBatcher:
         # Never overshoot the hard limit merely because tokenization is batched.
         # The configured schedule remains authoritative; a distribution drift
         # still fails clearly rather than silently dropping descriptors.
-        for _ in range(min(self.tokenize_batch_size, available)):
+        count = min(self.tokenize_batch_size, available)
+        if max_samples is not None:
+            count = min(count, max(0, int(max_samples)))
+        for _ in range(count):
             try:
                 samples.append(next(source))
             except StopIteration:
@@ -671,6 +720,8 @@ class OnlineJointBucketBatcher:
                 )
             token_ids = list(token_ids)
             native_bucket = self._native_text_bucket(len(token_ids))
+            if self.scheduler is not None:
+                self.scheduler.observe_native_target(native_bucket)
             sample["input_ids"] = token_ids
             sample["native_text_bucket"] = native_bucket
             self._queues[(resolution_name, native_bucket)].append(sample)
@@ -679,7 +730,7 @@ class OnlineJointBucketBatcher:
         self.peak_buffer_samples = max(self.peak_buffer_samples, buffered)
         if buffered > self.max_buffer_samples:
             raise AssertionError(f"buffer limit violated: {buffered} > {self.max_buffer_samples}")
-        return True
+        return len(samples)
 
     def state_dict(self) -> dict:
         pending = self._active_pending
@@ -688,16 +739,24 @@ class OnlineJointBucketBatcher:
         else:
             pending_specs = [entry[0] for entry in pending]
         return {
-            "version": 1,
-            "schedule": self._schedule,
-            "schedule_cursor": self._schedule_cursor,
+            "version": 3,
+            "dynamic_enabled": self.dynamic_enabled,
+            "schedule": (
+                self.scheduler.schedule if self.scheduler is not None else self._schedule
+            ),
+            "schedule_cursor": (
+                self.scheduler.schedule_cursor
+                if self.scheduler is not None else self._schedule_cursor
+            ),
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "queues": {
                 key: list(copy.deepcopy(queue)) for key, queue in self._queues.items()
             },
-            "pending_specs": copy.deepcopy(pending_specs),
+            "pending_specs": [self._checkpoint_spec(spec) for spec in pending_specs],
             "source_cursors": copy.deepcopy(self.source_cursors),
             "last_source_worker_id": self.last_source_worker_id,
             "source_samples": self.source_samples,
+            "scheduled_samples": self.scheduled_samples,
             "emitted_samples": self.emitted_samples,
             "promoted_samples": self.promoted_samples,
             "peak_buffer_samples": self.peak_buffer_samples,
@@ -706,18 +765,40 @@ class OnlineJointBucketBatcher:
         }
 
     def load_state_dict(self, state: dict) -> None:
-        if int(state.get("version", 0)) != 1:
+        version = int(state.get("version", 0))
+        if version not in {1, 2, 3}:
             raise ValueError(f"unsupported online bucket resume version: {state.get('version')}")
-        if tuple(state.get("schedule", ())) != self._schedule:
-            raise ValueError("online bucket schedule changed since checkpoint")
+        saved_dynamic = bool(state.get("dynamic_enabled", False)) if version >= 2 else False
+        if saved_dynamic != self.dynamic_enabled:
+            raise ValueError(
+                "dynamic bucket scheduler setting changed since checkpoint: "
+                f"checkpoint={saved_dynamic} current={self.dynamic_enabled}"
+            )
+        if self.scheduler is not None:
+            scheduler_state = state.get("scheduler")
+            if scheduler_state is None:
+                raise ValueError("dynamic checkpoint is missing scheduler state")
+            self.scheduler.load_state_dict(scheduler_state)
+            self._schedule = self.scheduler.schedule
+            self._schedule_cursor = self.scheduler.schedule_cursor
+        else:
+            if tuple(state.get("schedule", ())) != self._schedule:
+                raise ValueError("online bucket schedule changed since checkpoint")
+            self._schedule_cursor = int(state["schedule_cursor"])
         saved_queues = state.get("queues", {})
         if set(saved_queues) != set(self._queues):
             raise ValueError("online bucket queue keys changed since checkpoint")
         self._queues = {
             key: deque(copy.deepcopy(saved_queues[key])) for key in self._queues
         }
-        self._schedule_cursor = int(state["schedule_cursor"])
         self._restored_pending_specs = deque(copy.deepcopy(state.get("pending_specs", [])))
+        if version < 3:
+            # Versions 1/2 counted a spec as emitted when selected. Preserve
+            # that meaning for already checkpointed pending specs, then use
+            # the precise materialization-time counter for new selections.
+            for spec in self._restored_pending_specs:
+                if len(spec) == 5:
+                    spec[4]["emission_accounted"] = True
         self.source_cursors = {
             int(worker): dict(cursor)
             for worker, cursor in state.get("source_cursors", {}).items()
@@ -730,6 +811,9 @@ class OnlineJointBucketBatcher:
             "decode_fallback_duplicate_samples",
         ):
             setattr(self, name, int(state.get(name, 0)))
+        self.scheduled_samples = int(
+            state.get("scheduled_samples", state.get("emitted_samples", 0))
+        )
 
     def _eligible_count(self, resolution_name, target):
         return sum(
@@ -737,6 +821,22 @@ class OnlineJointBucketBatcher:
             for native in self.text_buckets
             if native <= target
         )
+
+    def _ready_resolutions(self, target):
+        return [
+            resolution_name
+            for resolution_name in self.resolution_names
+            if self._eligible_count(resolution_name, target) >= self.batch_size
+        ]
+
+    def _local_ready_mask(self):
+        if self.scheduler is None:
+            raise RuntimeError("ready masks require the dynamic scheduler")
+        counts = [
+            [len(self._queues[(resolution, native)]) for native in self.text_buckets]
+            for resolution in self.resolution_names
+        ]
+        return self.scheduler.ready_mask(counts)
 
     def _take_eligible(self, resolution_name, target, count):
         selected = []
@@ -766,13 +866,11 @@ class OnlineJointBucketBatcher:
         return self._take_eligible(resolution_name, target, count)
 
     def _select_spec(self, source):
+        if self.scheduler is not None:
+            return self._select_dynamic_spec(source)
         target = self._schedule[self._schedule_cursor % len(self._schedule)]
         while True:
-            ready = [
-                resolution_name
-                for resolution_name in self.resolution_names
-                if self._eligible_count(resolution_name, target) >= self.batch_size
-            ]
+            ready = self._ready_resolutions(target)
             if ready:
                 break
             if not self._tokenize_more(source):
@@ -792,15 +890,127 @@ class OnlineJointBucketBatcher:
         if len(selected) != self.batch_size:
             raise AssertionError("eligible count and selected batch disagree")
         self._schedule_cursor += 1
-        self.emitted_samples += self.batch_size
+        self.scheduled_samples += self.batch_size
         self.promoted_samples += promoted
-        return target, resolution_name, selected, promoted
+        return target, resolution_name, selected, promoted, {
+            "desired_target": target,
+            "selected_target": target,
+            "fallback": False,
+            "fallback_to_max": False,
+            "fallback_extra_text_tokens": 0,
+            "lookahead_used": 0,
+            "lookahead_exhausted": False,
+            "local_ready_mask": None,
+            "common_ready_mask": None,
+            "control_wait_ms": 0.0,
+            "schedule_version": 0,
+            "base_weights": list(self.text_weights),
+            "schedule_update_event": None,
+            "emission_accounted": False,
+        }
+
+    def _select_dynamic_spec(self, source):
+        scheduler = self.scheduler
+        desired = scheduler.desired_target
+        desired_bit = 1 << self.text_buckets.index(desired)
+        lookahead_budget = min(
+            self.lookahead_per_slot,
+            max(0, self.soft_buffer_limit - self.buffered_samples),
+        )
+        lookahead_used = 0
+        source_done = False
+        local_mask = self._local_ready_mask()
+        while not (local_mask & desired_bit) and lookahead_used < lookahead_budget:
+            admitted = self._tokenize_more(
+                source, max_samples=lookahead_budget - lookahead_used,
+            )
+            if not admitted:
+                source_done = True
+                break
+            lookahead_used += admitted
+            local_mask = self._local_ready_mask()
+        locally_limited = not bool(local_mask & desired_bit) and (
+            source_done
+            or lookahead_used >= lookahead_budget
+            or self.buffered_samples >= self.soft_buffer_limit
+        )
+        control = self.bucket_controller.synchronize(
+            local_mask,
+            has_completed_window=scheduler.has_completed_window,
+            lookahead_exhausted=locally_limited,
+        )
+        if control.common_ready_mask == 0:
+            raise RuntimeError(
+                "dynamic joint bucket found no common ready target after bounded "
+                f"lookahead; local_mask={local_mask:#x} buffer={self.buffered_samples} "
+                f"lookahead={lookahead_used}/{lookahead_budget} source_done={source_done}"
+            )
+        selection = scheduler.select(control.common_ready_mask)
+        target = selection.selected_target
+        ready = self._ready_resolutions(target)
+        if not ready:
+            raise AssertionError(
+                f"common target {target} is not locally ready; mask={local_mask:#x}"
+            )
+        resolution_name = max(
+            ready,
+            key=lambda name: (
+                len(self._queues[(name, target)]),
+                self._eligible_count(name, target),
+            ),
+        )
+        selected, promoted = self._take_eligible(
+            resolution_name, target, self.batch_size,
+        )
+        if len(selected) != self.batch_size:
+            raise AssertionError("eligible count and selected batch disagree")
+        scheduler.record_selection(selection)
+        self.scheduled_samples += self.batch_size
+        self.promoted_samples += promoted
+        update_event = None
+        control_wait_ms = control.wait_ms
+        if scheduler.at_schedule_boundary and control.all_have_completed_window:
+            local_counts = scheduler.peek_completed_window()
+            weights, update_event, update_wait_ms = self.bucket_controller.update_weights(
+                local_counts,
+                old_weights=scheduler.base_weights,
+                schedule_version=scheduler.schedule_version,
+                safety_margin=scheduler.safety_margin,
+            )
+            scheduler.pop_completed_window()
+            scheduler.install_weights(weights, update_event["schedule_version"])
+            control_wait_ms += update_wait_ms
+        self._schedule = scheduler.schedule
+        self._schedule_cursor = scheduler.schedule_cursor
+        return target, resolution_name, selected, promoted, {
+            "desired_target": selection.desired_target,
+            "selected_target": selection.selected_target,
+            "fallback": selection.fallback,
+            "fallback_to_max": selection.fallback_to_max,
+            "fallback_extra_text_tokens": (
+                selection.extra_text_tokens_per_sample * self.batch_size
+            ),
+            "lookahead_used": lookahead_used,
+            "lookahead_exhausted": control.any_lookahead_exhausted,
+            "local_ready_mask": local_mask,
+            "common_ready_mask": control.common_ready_mask,
+            "control_wait_ms": control_wait_ms,
+            "schedule_version": scheduler.schedule_version,
+            "base_weights": list(scheduler.base_weights),
+            "schedule_update_event": update_event,
+            "emission_accounted": False,
+            "queue_counts": {
+                f"{resolution}:{native}": len(self._queues[(resolution, native)])
+                for resolution in self.resolution_names
+                for native in self.text_buckets
+            },
+        }
 
     def _decode_spec(self, spec, futures, source, executor, decoder):
         from ..data.tar_dataset import TarDecodeFailure
 
         wait_start = time.perf_counter()
-        target, resolution_name, samples, _ = spec
+        target, resolution_name, samples, _, scheduler_meta = self._unpack_spec(spec)
         pixels = [None] * len(samples)
         pending = list(zip(range(len(samples)), futures))
         while pending:
@@ -866,10 +1076,40 @@ class OnlineJointBucketBatcher:
         promoted = sum(
             int(sample["native_text_bucket"]) < target for sample in samples
         )
-        return (target, resolution_name, samples, promoted), pixels, decode_wait
+        return (
+            target, resolution_name, samples, promoted, scheduler_meta,
+        ), pixels, decode_wait
+
+    def _unpack_spec(self, spec):
+        if len(spec) == 5:
+            return spec
+        if len(spec) == 4 and not self.dynamic_enabled:
+            target, resolution_name, samples, promoted = spec
+            return target, resolution_name, samples, promoted, {
+                "desired_target": target,
+                "selected_target": target,
+                "fallback": False,
+                "fallback_to_max": False,
+                "fallback_extra_text_tokens": 0,
+                "lookahead_used": 0,
+                "lookahead_exhausted": False,
+                "local_ready_mask": None,
+                "common_ready_mask": None,
+                "control_wait_ms": 0.0,
+                "schedule_version": 0,
+                "base_weights": list(self.text_weights),
+                "schedule_update_event": None,
+                # Four-field specs only exist in pre-v3 checkpoints, where
+                # selection already incremented emitted_samples.
+                "emission_accounted": True,
+            }
+        raise ValueError(f"unsupported pending spec shape: {len(spec)}")
 
     def _materialize(self, spec, pixels, decode_wait):
-        target, resolution_name, samples, promoted = spec
+        target, resolution_name, samples, promoted, scheduler_meta = self._unpack_spec(spec)
+        if not scheduler_meta.get("emission_accounted", False):
+            self.emitted_samples += len(samples)
+            scheduler_meta["emission_accounted"] = True
         pixel_values = torch.stack(pixels)
         pin_memory = torch.cuda.is_available()
         slot = self._slot
@@ -907,12 +1147,14 @@ class OnlineJointBucketBatcher:
             "bucket_promoted_samples": promoted,
             "bucket_buffer_samples": self.buffered_samples,
             "bucket_source_samples": self.source_samples,
+            "bucket_scheduled_samples": self.scheduled_samples,
             "bucket_emitted_samples": self.emitted_samples,
             "bucket_decode_wait_seconds": decode_wait,
             "bucket_decode_error_samples_cumulative": self.decode_error_samples,
             "bucket_decode_fallback_duplicates_cumulative": (
                 self.decode_fallback_duplicate_samples
             ),
+            "bucket_scheduler": copy.deepcopy(scheduler_meta),
             "_resume_spec": spec,
         }
 
@@ -1321,6 +1563,14 @@ def train(cfg: ExperimentConfig):
     aspect_buckets = ()
     aspect_weights = ()
     online_joint_bucketing = False
+    dynamic_bucket_enabled = bool(
+        getattr(cfg.data, "dynamic_joint_bucket_scheduler", False)
+    )
+    text_buckets = tuple(
+        int(x) for x in getattr(cfg.train, "text_length_buckets", ())
+    )
+    bucket_control_group = None
+    bucket_controller = None
     if bool(getattr(cfg.data, "bucket", False)):
         aspect_buckets = build_aspect_buckets(
             cfg.data.image_size,
@@ -1354,8 +1604,24 @@ def train(cfg: ExperimentConfig):
                 ),
                 flush=True,
             )
+    if dynamic_bucket_enabled and not online_joint_bucketing:
+        raise ValueError(
+            "dynamic_joint_bucket_scheduler requires tar online_joint_bucketing"
+        )
+    if dynamic_bucket_enabled:
+        if not text_buckets:
+            raise ValueError(
+                "dynamic_joint_bucket_scheduler requires non-empty text_length_buckets"
+            )
+        if distributed:
+            bucket_control_group = torch.distributed.new_group(backend="gloo")
+            bucket_controller = DistributedBucketController(
+                bucket_control_group,
+                bucket_count=len(cfg.train.text_length_buckets),
+            )
+        else:
+            bucket_controller = LocalBucketController()
 
-    text_buckets = tuple(int(x) for x in getattr(cfg.train, "text_length_buckets", ()))
     pad_text_to_max = bool(getattr(cfg.train, "pad_text_to_max_length", True))
     text_bucket_weights = tuple(
         int(x) for x in getattr(cfg.train, "text_length_bucket_weights", ())
@@ -1367,6 +1633,19 @@ def train(cfg: ExperimentConfig):
         "tokenize_batch_size": int(getattr(cfg.data, "tokenize_batch_size", 256)),
         "bucket_buffer_max_samples": int(
             getattr(cfg.data, "bucket_buffer_max_samples", 8192)
+        ),
+        "dynamic_joint_bucket_scheduler": dynamic_bucket_enabled,
+        "bucket_lookahead_per_slot": int(
+            getattr(cfg.data, "bucket_lookahead_per_slot", 512)
+        ),
+        "bucket_soft_buffer_limit": int(
+            getattr(cfg.data, "bucket_soft_buffer_limit", 6144)
+        ),
+        "bucket_long_term_window_per_rank": int(
+            getattr(cfg.data, "bucket_long_term_window_per_rank", 50_000)
+        ),
+        "bucket_long_term_safety_margin": float(
+            getattr(cfg.data, "bucket_long_term_safety_margin", 0.02)
         ),
         "tokenizer_pretrained": str(cfg.model.qwen_vl.pretrained),
         "tokenizer_max_length": int(cfg.model.qwen_vl.max_length),
@@ -1455,6 +1734,16 @@ def train(cfg: ExperimentConfig):
             max_buffer_samples=getattr(cfg.data, "bucket_buffer_max_samples", 8192),
             decode_workers=getattr(cfg.data, "decode_workers", cfg.data.num_workers),
             decode_prefetch_batches=getattr(cfg.data, "decode_prefetch_batches", 2),
+            dynamic_scheduler=dynamic_bucket_enabled,
+            bucket_controller=bucket_controller,
+            lookahead_per_slot=getattr(cfg.data, "bucket_lookahead_per_slot", 512),
+            soft_buffer_limit=getattr(cfg.data, "bucket_soft_buffer_limit", 6144),
+            long_term_window_per_rank=getattr(
+                cfg.data, "bucket_long_term_window_per_rank", 50_000,
+            ),
+            long_term_safety_margin=getattr(
+                cfg.data, "bucket_long_term_safety_margin", 0.02,
+            ),
         )
         if online_resume_state is not None:
             loader.load_state_dict(online_resume_state["batcher"])
@@ -1464,6 +1753,7 @@ def train(cfg: ExperimentConfig):
                 f"smooth_weights={text_bucket_weights} "
                 f"joint_lengths={tuple(bucket + loader.max_image_tokens for bucket in text_buckets)} "
                 "aspect=rank-local adaptive decode=after-selection "
+                f"dynamic_scheduler={dynamic_bucket_enabled} "
                 "buffer_drop=forbidden malformed=skip+backfill",
                 flush=True,
             )
@@ -1531,7 +1821,9 @@ def train(cfg: ExperimentConfig):
             if next_spec is not None:
                 # The batcher has already yielded this spec to DataPrefetcher,
                 # so put it back ahead of decode-pending specs for resume.
-                batcher_state["pending_specs"].insert(0, next_spec)
+                batcher_state["pending_specs"].insert(
+                    0, loader._checkpoint_spec(next_spec),
+                )
             status["online_joint"] = {
                 "batcher": batcher_state,
                 "prefetcher": prefetcher_state,
@@ -1567,6 +1859,191 @@ def train(cfg: ExperimentConfig):
     online_emitted_samples = 0
     online_decode_error_samples = 0
     online_decode_fallback_duplicates = 0
+    scheduler_telemetry_interval = int(
+        getattr(cfg.data, "bucket_telemetry_interval_steps", 100)
+    )
+    scheduler_diagnostic_rate_limit = int(
+        getattr(cfg.data, "bucket_diagnostic_rate_limit_steps", 1000)
+    )
+    if dynamic_bucket_enabled and scheduler_telemetry_interval < 1:
+        raise ValueError("bucket_telemetry_interval_steps must be positive")
+    if dynamic_bucket_enabled and scheduler_diagnostic_rate_limit < 1:
+        raise ValueError("bucket_diagnostic_rate_limit_steps must be positive")
+    scheduler_telemetry_path = os.path.join(out_dir, "bucket_scheduler.jsonl")
+    scheduler_last_diagnostic_step = start_step - scheduler_diagnostic_rate_limit
+
+    def new_scheduler_window(start: int) -> dict:
+        bucket_count = len(text_buckets)
+        return {
+            "start_step": int(start),
+            "steps": 0,
+            "base_weights": list(text_bucket_weights),
+            "schedule_version": 0,
+            "desired": [0] * bucket_count,
+            "selected": [0] * bucket_count,
+            "fallback_matrix": [[0] * bucket_count for _ in range(bucket_count)],
+            "fallback_steps": 0,
+            "fallback_to_max_steps": 0,
+            "fallback_extra_text_tokens_sum": 0,
+            "buffer_sum": 0,
+            "buffer_peak": 0,
+            "lookahead_exhausted_steps": 0,
+            "control_wait_ms_sum": 0.0,
+            "control_wait_ms_max": 0.0,
+            "hard_limit_hits": 0,
+            "peak_snapshot": None,
+        }
+
+    scheduler_window = new_scheduler_window(start_step)
+
+    def append_scheduler_record(record: dict) -> None:
+        if rank != 0:
+            return
+        with open(scheduler_telemetry_path, "a", encoding="utf-8") as stream:
+            json.dump(record, stream, ensure_ascii=False, sort_keys=True)
+            stream.write("\n")
+
+    def observe_scheduler_batch(current_step: int, batch: dict) -> None:
+        if not dynamic_bucket_enabled:
+            return
+        meta = batch.get("bucket_scheduler")
+        if not isinstance(meta, dict):
+            raise RuntimeError("dynamic bucket batch is missing scheduler metadata")
+        desired = int(meta["desired_target"])
+        selected = int(meta["selected_target"])
+        desired_index = text_buckets.index(desired)
+        selected_index = text_buckets.index(selected)
+        scheduler_window["steps"] += 1
+        scheduler_window["base_weights"] = list(meta["base_weights"])
+        scheduler_window["schedule_version"] = int(meta["schedule_version"])
+        scheduler_window["desired"][desired_index] += 1
+        scheduler_window["selected"][selected_index] += 1
+        if bool(meta["fallback"]):
+            scheduler_window["fallback_steps"] += 1
+            scheduler_window["fallback_matrix"][desired_index][selected_index] += 1
+        if bool(meta["fallback_to_max"]):
+            scheduler_window["fallback_to_max_steps"] += 1
+        scheduler_window["fallback_extra_text_tokens_sum"] += int(
+            meta["fallback_extra_text_tokens"]
+        )
+        buffer_samples = int(batch.get("bucket_buffer_samples", 0))
+        scheduler_window["buffer_sum"] += buffer_samples
+        scheduler_window["lookahead_exhausted_steps"] += int(
+            bool(meta["lookahead_exhausted"])
+        )
+        wait_ms = float(meta["control_wait_ms"])
+        scheduler_window["control_wait_ms_sum"] += wait_ms
+        scheduler_window["control_wait_ms_max"] = max(
+            scheduler_window["control_wait_ms_max"], wait_ms,
+        )
+        hard_limit = int(getattr(cfg.data, "bucket_buffer_max_samples", 8192))
+        scheduler_window["hard_limit_hits"] += int(buffer_samples >= hard_limit)
+        if buffer_samples >= scheduler_window["buffer_peak"]:
+            scheduler_window["buffer_peak"] = buffer_samples
+            scheduler_window["peak_snapshot"] = {
+                "rank": rank,
+                "buffer_samples": buffer_samples,
+                "queue_counts": dict(meta.get("queue_counts", {})),
+                "ready_mask": meta.get("local_ready_mask"),
+                "common_ready_mask": meta.get("common_ready_mask"),
+                "desired_target": desired,
+                "selected_target": selected,
+            }
+        event = meta.get("schedule_update_event")
+        if event is not None:
+            append_scheduler_record({"step": int(current_step), **event})
+
+    def flush_scheduler_window(current_step: int, *, force: bool = False) -> None:
+        nonlocal scheduler_window, scheduler_last_diagnostic_step
+        if not dynamic_bucket_enabled or scheduler_window["steps"] == 0:
+            return
+        if not force and scheduler_window["steps"] < scheduler_telemetry_interval:
+            return
+        local_sum = torch.tensor([
+            float(scheduler_window["buffer_sum"]),
+            float(scheduler_window["fallback_extra_text_tokens_sum"]),
+            float(scheduler_window["control_wait_ms_sum"]),
+            float(scheduler_window["hard_limit_hits"]),
+        ], dtype=torch.float64, device="cpu")
+        local_max = torch.tensor([
+            float(scheduler_window["buffer_peak"]),
+            float(scheduler_window["control_wait_ms_max"]),
+        ], dtype=torch.float64, device="cpu")
+        snapshots = [scheduler_window["peak_snapshot"]]
+        if distributed:
+            torch.distributed.all_reduce(
+                local_sum, op=torch.distributed.ReduceOp.SUM,
+                group=bucket_control_group,
+            )
+            torch.distributed.all_reduce(
+                local_max, op=torch.distributed.ReduceOp.MAX,
+                group=bucket_control_group,
+            )
+            snapshots = [None] * world_size
+            torch.distributed.all_gather_object(
+                snapshots,
+                scheduler_window["peak_snapshot"],
+                group=bucket_control_group,
+            )
+        if rank == 0:
+            steps = int(scheduler_window["steps"])
+            peak_snapshot = max(
+                (snapshot for snapshot in snapshots if snapshot is not None),
+                key=lambda snapshot: (snapshot["buffer_samples"], -snapshot["rank"]),
+            )
+            fallback_rate = scheduler_window["fallback_steps"] / steps
+            fallback_max_rate = scheduler_window["fallback_to_max_steps"] / steps
+            diagnostic_reasons = []
+            if int(local_max[0].item()) > 4096:
+                diagnostic_reasons.append("global_buffer_gt_4096")
+            if fallback_rate > 0.05:
+                diagnostic_reasons.append("fallback_rate_gt_5pct")
+            if fallback_max_rate > 0.01:
+                diagnostic_reasons.append("fallback_to_1024_rate_gt_1pct")
+            if scheduler_window["lookahead_exhausted_steps"]:
+                diagnostic_reasons.append("lookahead_exhausted")
+            diagnostic = None
+            if (
+                diagnostic_reasons
+                and current_step - scheduler_last_diagnostic_step
+                >= scheduler_diagnostic_rate_limit
+            ):
+                diagnostic = {
+                    "reasons": diagnostic_reasons,
+                    "peak_rank": int(peak_snapshot["rank"]),
+                    "queue_counts": peak_snapshot["queue_counts"],
+                    "ready_mask": peak_snapshot["ready_mask"],
+                    "common_ready_mask": peak_snapshot["common_ready_mask"],
+                    "desired_target": peak_snapshot["desired_target"],
+                    "selected_target": peak_snapshot["selected_target"],
+                }
+                scheduler_last_diagnostic_step = current_step
+            append_scheduler_record({
+                "event": "bucket_scheduler_window",
+                "window_start_step": scheduler_window["start_step"],
+                "window_end_step": int(current_step),
+                "schedule_version": scheduler_window["schedule_version"],
+                "base_weights": scheduler_window["base_weights"],
+                "desired_target_counts": scheduler_window["desired"],
+                "selected_target_counts": scheduler_window["selected"],
+                "fallback_counts_by_pair": scheduler_window["fallback_matrix"],
+                "fallback_steps": scheduler_window["fallback_steps"],
+                "fallback_to_1024_steps": scheduler_window["fallback_to_max_steps"],
+                "fallback_extra_text_tokens_sum": int(local_sum[1].item()),
+                "global_buffer_max": int(local_max[0].item()),
+                "global_buffer_mean": (
+                    float(local_sum[0].item()) / (steps * world_size)
+                ),
+                "global_buffer_peak_rank": int(peak_snapshot["rank"]),
+                "global_buffer_hard_limit_hits": int(local_sum[3].item()),
+                "lookahead_exhausted_steps": scheduler_window[
+                    "lookahead_exhausted_steps"
+                ],
+                "control_wait_ms_sum": float(local_sum[2].item()),
+                "control_wait_ms_max": float(local_max[1].item()),
+                "diagnostic": diagnostic,
+            })
+        scheduler_window = new_scheduler_window(current_step + 1)
     timestep_metrics = bool(getattr(cfg.train, "timestep_metrics", False))
     timestep_bin_counts = torch.zeros(10, device=dev, dtype=torch.float64)
     timestep_bin_fm_sums = torch.zeros_like(timestep_bin_counts)
@@ -1630,6 +2107,8 @@ def train(cfg: ExperimentConfig):
                 "bucket_decode_fallback_duplicates_cumulative",
                 online_decode_fallback_duplicates,
             ))
+            observe_scheduler_batch(step, batch)
+            flush_scheduler_window(step)
         timer.start()
         profile_begin(step)
         with torch.no_grad():
@@ -2003,6 +2482,8 @@ def train(cfg: ExperimentConfig):
                 print(f"[train] ckpt saved @ completed_step {completed_steps}", flush=True)
         step += 1
 
+    if dynamic_bucket_enabled and scheduler_window["steps"]:
+        flush_scheduler_window(max(start_step, step - 1), force=True)
     if os.environ.get("UV3_BENCH_NO_CKPT") != "1":
         opt_model._step = step
         save_ckpt(

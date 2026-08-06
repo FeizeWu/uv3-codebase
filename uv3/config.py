@@ -88,6 +88,15 @@ class DataConfig:
     online_joint_bucketing: bool = False
     tokenize_batch_size: int = 256
     bucket_buffer_max_samples: int = 8192
+    # Supply-driven text-target fallback. Historical benchmark configs remain
+    # fixed-schedule unless this is explicitly enabled.
+    dynamic_joint_bucket_scheduler: bool = False
+    bucket_lookahead_per_slot: int = 512
+    bucket_soft_buffer_limit: int = 6144
+    bucket_long_term_window_per_rank: int = 50_000
+    bucket_long_term_safety_margin: float = 0.02
+    bucket_telemetry_interval_steps: int = 100
+    bucket_diagnostic_rate_limit_steps: int = 1000
     decode_workers: int = 4
     decode_prefetch_batches: int = 2
     alpha: bool = True                     # preserve RGBA else pad ones
