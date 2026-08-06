@@ -1,6 +1,6 @@
 # UV3 大型预训练上线前审计
 
-日期：2026-08-06  
+日期：2026-08-06；本轮修复与验证更新：2026-08-07
 被审计代码：`/mnt/data/users/wfz/uv3-codebase`，基线 commit `b3b5631526f28092a2ca838b457b1654018899e1`  
 直接 bug 修复 commit：`0b3c6b5`  
 参考实现：`/Users/wufeize/uv3/UniWorld-Pretrain-main`  
@@ -9,9 +9,10 @@
 ## 审计边界与当前结论
 
 - 按要求，Self-Flow 的“具体对齐层数/层数选择”不参与对齐判断。
-- 本轮只直接修复已经导致训练中断的 online joint bucket buffer 问题，并把生产默认步数改为 100K。
-- 下列其余发现均未修改生产实现；需要先由项目负责人确认，再逐项修复和验证。
-- 当前结论：**不建议立即启动 100K 大实验**。至少 `P0-01`、`P0-02`、`P0-03` 需要先决策。
+- 首轮只直接修复了已经导致训练中断的 online joint bucket buffer 问题，并把生产默认步数改为 100K。
+- 经项目负责人批准，本轮继续修复并验证了 `P0-01`、`P0-03`、`P1-02`、`P1-03`，以及保留全部历史 checkpoint；具体证据记录在对应条目中。
+- `P0-02` 按决定暂缓；其他未经批准的审计项均未修改。
+- 当前结论：上述获批修复已达到合入条件，但这不等同于已放行正式 100K。启动前仍需明确接受暂缓的 `P0-02` 风险，并完成本文后部列出的多机 shape 矩阵和长时间 soak 门槛。
 
 ## 已直接修复：联合分桶 descriptor buffer 溢出
 
@@ -54,7 +55,7 @@
 
 ## P0：大型实验阻断项
 
-### P0-01：BF16 master/EMA/Adam 状态破坏 Self-Flow EMA 语义
+### P0-01：BF16 master/EMA/Adam 状态破坏 Self-Flow EMA 语义【已修复并验证】
 
 证据：
 
@@ -74,20 +75,20 @@
 
 风险：teacher 接近冻结，projector 可能主要在拟合一个静态 target；Self-Flow loss 快速下降不能证明 EMA 正确。
 
-建议修复方向（尚未实施）：
+已落地修改：
 
-- student、teacher、projector 和 Adam master/moments 保持 FP32 storage。
-- FSDP `MixedPrecisionPolicy` 继续用 BF16 forward/reduce。
-- 修复后先做显存、吞吐和数值 smoke，再决定是否允许 100K。
+- student、teacher、projector 参数和 Adam moments 使用 FP32 storage；MMDiT 的 forward/reduce 仍由 FSDP `MixedPrecisionPolicy` 使用 BF16，未改成全程 FP32 计算。
+- 构建后、optimizer 首步后和 resume 后均执行 dtype contract；旧 checkpoint 中的 BF16 Adam moments 在加载后显式升级为 FP32。
+- 纯单流下永远不会参与 forward 的双流 modulation 参数被冻结，避免 resume 后产生无意义的空/零 optimizer state。
 
-必须测试：
+验证证据：
 
-1. 构建、FSDP 包装和 optimizer 首步后检查 dtype contract。
-2. 两卡 sharded EMA 与单卡 FP32 reference 连续更新对比。
-3. `decay=.9999` 解析值 10K-step 回归测试。
-4. 真实 3.86B 模型显存峰值和速度测试。
+- FP32 EMA 解析值、错误 BF16 teacher/Adam state 检出、legacy BF16 moment 升级均有单测覆盖。
+- 四卡 FSDP/HSDP runtime 验证通过：BF16 compute + FP32 storage，rank 间参数一致。
+- 四卡真实 tar smoke 的 step-4 checkpoint 实测：model `21/21`、teacher `17/17`、optimizer tensor state `57/57` 均为 FP32，不含 BF16 storage。
+- 本轮全量测试 `62 passed`。真实 3.86B 显存/吞吐仍属于正式规模性能验收，不以这个小模型 correctness smoke 替代。
 
-### P0-02：运行环境跨项目、跨 venv 污染，不可复现
+### P0-02：运行环境跨项目、跨 venv 污染，不可复现【按决定暂缓，未修改】
 
 `.venv-cu128/site-packages/uniworld_shared.pth` 注入了：
 
@@ -112,9 +113,9 @@
 
 建议修复方向（尚未实施）：建立完全自包含、锁定版本的环境或镜像，删除跨 venv `.pth`。四节点 preflight 输出并比对 Python、模块路径/版本、torch/CUDA/NCCL、git SHA 和 config hash。
 
-### P0-03：checkpoint resume 不是精确续训
+### P0-03：checkpoint resume 不是精确续训【已修复并验证；使用新 checkpoint schema】
 
-当前恢复 model、optimizer、部分 torch RNG，但没有完整恢复：
+修复前只恢复 model、optimizer、部分 torch RNG，但没有完整恢复：
 
 - Python `random` 和 NumPy RNG。
 - tar/source 的真实 cursor。
@@ -122,16 +123,26 @@
 - DataLoader worker/prefetch/decode 状态。
 - 下一批稳定 sample IDs。
 
-descriptor 虽产生 `shard_pos/row_pos`，但 batch materialize 丢掉这些 ID；保存的 `data_status` 没有随训练推进更新。resume 实际从 epoch 头重新开始，会重复此前数据前缀。100K 中断后这不是小误差。
+旧实现中 descriptor 虽产生 `shard_pos/row_pos`，但 batch materialize 丢掉这些 ID；保存的 `data_status` 没有随训练推进更新。旧 checkpoint resume 会从 epoch 头重新开始并重复此前数据前缀。
 
-此外：
+已落地修改：
+
+- 每个 rank、每个 DataLoader worker 保存 `epoch/worker/shard/parquet/row-group/row` cursor；resume 直接打开断点 parquet，按确定性 row-group 顺序定位，只跳过该 row-group 内已消费行，不从 manifest/epoch 开头逐样本重放。
+- 保存并恢复 25 个 joint bucket 队列、smooth schedule cursor、source cursors、decode pending descriptors 和下一批 prefetch descriptor。checkpoint 不保存像素 tensor，坏图仍按相同 descriptor 顺序重新解码。
+- 保存并恢复 Python、NumPy、CPU torch、CUDA 和独立训练 generator 的每-rank RNG；DataLoader 使用独立 generator，pipeline 重建后再次恢复训练 RNG。
+- checkpoint 写入 manifest digest/数量、world size、workers-per-rank、caption 字段、宽高比桶、batch size、text 桶/权重和 tokenizer 路径/长度等数据管线签名；任一项变化时 fail-fast，不声称精确续训。生产 online-bucket 路径遇到旧 schema checkpoint 也会 fail-fast，禁止静默重复 epoch 前缀。
+
+验证证据：
+
+- 单测覆盖“直接打开保存的 parquet、旧 parquet 不再读取”、4-worker 后续 24 个 descriptor 顺序、joint queue/pending/prefetch 恢复，以及 manifest/topology/pipeline 配置不一致拒绝恢复。
+- 四卡真实 tar：连续 `0→4` 与从同一 `step 2` checkpoint 新进程 `2→4` 的 step-2/3 loss 分别同为 `3.1068/3.1692`。
+- 两个 step-4 checkpoint 的 model、所有 Adam 参数/moments、teacher、每-rank RNG、每-rank data pipeline state 逐 tensor/字段语义完全一致。PyTorch 在 optimizer load 后仅把等值 `betas` 容器从 tuple 表示为 list，不影响超参数值或 tensor state。
+
+下列原审计发现不属于本次获批的 cursor/RNG 修复，仍未修改：
 
 - trainer 在验证 checkpoint 前可能覆盖 run `config.yaml`。
 - `RESUME_EXPECTED_STEP` 没有读取 checkpoint 验证真实 step。
 - optimizer state `strict=False` 可能在布局变化时静默漏载。
-- Self-Flow 开/关导致 checkpoint key 和 optimizer layout 不兼容。
-
-必须测试：连续 `N+M` 与 `N → save → 新进程 resume → M` 对比 model、teacher、projector、optimizer、RNG、后续 sample IDs 和 loss；不能只验证曲线 step 连上。
 
 ## Self-Flow / Flow Matching 与 UniWorld 对齐结论
 
@@ -168,7 +179,7 @@ descriptor 虽产生 `shard_pos/row_pos`，但 batch materialize 丢掉这些 ID
 已运行的正向测试：
 
 - `tests/test_flow.py + tests/test_attn_mask.py`：`9/9` 通过。
-- `tests/test_self_flow.py`：`8/8` 通过；包括 uniform token-t 时 custom per-token path 与原生 scalar path 等价。
+- `tests/test_self_flow.py`：`18/18` 通过；包括 uniform token-t 时 custom per-token path 与原生 scalar path 等价，以及本轮新增的配置、初始化、精度和关闭 Self-Flow resume 测试。
 - `tests/test_flexmask.py` GPU 测试：`3/3` 通过；padding-hole/document mask 与 dense SDPA 对齐。
 
 仍缺的上线证据：
@@ -187,18 +198,22 @@ trainer 使用 `min(student_tokens, teacher_tokens)` 后截断两边；参考实
 
 建议测试：5 个 resolution × 5 个 text bucket 下，断言 student/teacher feature shape 完全相同且 image token 数等于 `n_img`。
 
-### P1-02：Self-Flow 配置与参考存在未显式化差异
+### P1-02：Self-Flow 配置与参考存在未显式化差异【已修复并验证】
 
-- `projector_dim` 配置字段存在，但 trainer 未传入，非默认值静默无效。
-- projector 初始化使用 PyTorch 默认 Kaiming/随机 bias；参考为 Xavier/bias=0。
-- `mask_ratio=0` 语义不一致：参考为全部 paired token，当前特判为全部原始 t；当前 `.25` 不受影响。
-- mask/ratio/EMA/coeff/projector_dim 缺少生产级范围校验。
-- `SelfFlowConfig.enabled` 默认 True，配置遗漏时可能意外开启。
-- patch-size 参数没有贯穿 Self-Flow 调用；当前 patch=2 安全，其他值有风险。
+- `projector_dim` 已真正传入 projector；权重改为 Xavier uniform、bias=0，与参考初始化一致。
+- `mask_ratio=0` 已恢复为全部 paired timestep token；independent 模式仍用 `min(t,s)` 作为 teacher timestep。
+- coeff、EMA decay、mask ratio、ratio、projector dim、timestep mode 增加 fail-fast 范围/枚举校验。
+- `SelfFlowConfig.enabled` 默认改为 False，只有显式生产配置才开启。
+- `patch_size` 已贯穿 latent/token 构造，不再暗含固定值 2。
+- 对齐层数选择按要求保持 UV3 现有方案，没有照搬 UniWorld 小模型消融参数。
 
-### P1-03：后期关闭 Self-Flow 尚不能安全 resume
+上述行为均有针对性单测；Self-Flow 测试还覆盖 projector shape/init、零 mask 语义、独立 timestep、纯单流 capture 和 FP32 storage contract。
 
-启用 Self-Flow 的 checkpoint model 是 `ModuleList([mmdit, projector])`，key 带 `0.`/`1.`；关闭后目标是裸 MMDiT，optimizer layout 也不同。当前没有转换工具或同 run 的 off schedule，与“收敛后关闭 Self-Flow”计划冲突。
+### P1-03：后期关闭 Self-Flow 尚不能安全 resume【已修复并验证】
+
+启用 Self-Flow 的 checkpoint model 是 `ModuleList([mmdit, projector])`，key 带 `0.`/`1.`；关闭后目标是裸 MMDiT，optimizer layout 也不同。现在 `load_ckpt(..., allow_self_flow_disable=True)` 会校验并剥离 student 的 `0.` 前缀、丢弃 projector `1.` state，并按 FQN 过滤/转换 optimizer state；显式 `UV3_RESUME_CKPT` 支持从旧 run checkpoint 启动新的关闭 Self-Flow run，路径不存在时 fail-fast。
+
+单测已验证 model 与 Adam moments 转换。四卡运行级 smoke 又从开启 Self-Flow 的 step-2 checkpoint 关闭 Self-Flow 续跑至 step 3；新 checkpoint 只含裸 `transformer` model、无 teacher/projector extra model，Adam state 为 15 个 student entries，运行成功。
 
 ### P1-04：部分训练配置字段写了但未生效
 
@@ -236,15 +251,15 @@ P 模式且带 byte transparency 的图片直接 `.convert("RGB")` 会触发用�
 
 建议测试：超大图/非法 metadata fixture、RSS soak、crop-area 分布与肉眼样本审查。
 
-### P1-07：checkpoint 长跑可靠性不足
+### P1-07：checkpoint 长跑可靠性不足【历史保留已修复，其余未修改】
 
-- 只有一个持续覆盖的 `ckpt.pt`，没有 2–3 份轮转恢复点。
+- 每次保存现在生成不可变的 `ckpt_step_XXXXXXXX.pt`，全部保留；`ckpt.pt` 只作为 latest pointer。OSS/FUSE 不支持 symlink 时使用先 stage、校验大小/step、再替换的 regular-file copy fallback。
+- 升级前遗留的单个 `ckpt.pt` 会先复制到其 step 对应的不可变文件；同一 final step 的重复 save 会复用已验证文件，不再重复写大 checkpoint。
 - OSS/FUSE 上不能仅凭 rename 假定完整原子语义。
 - 只检查文件大小和 step，没有 checksum/完整 tensor 校验。
 - rank0 保存失败时，其他 rank 可能卡在 barrier。
-- 最终 step 可能重复写一次约 29GB checkpoint。
 
-建议做保存阶段故障注入，并保证任何阶段失败后至少一份旧 checkpoint 可恢复。
+单测和四卡 smoke 均确认 step-2、step-4 文件同时存在且 latest 指向/复制 step 4。剩余风险仍建议做保存阶段故障注入；按项目负责人要求，不增加自动删除或只保留 latest 的 retention 策略。
 
 ### P1-08：100K 自动评测与快照策略仍是 10K 时代设计
 
@@ -288,18 +303,16 @@ trainer 将 rank0 的 `loss.item()` 直接写入 JSON，没有对总 loss 做跨
 
 ## 建议审批顺序
 
-1. `P0-01`：批准 FP32 master/EMA/optimizer storage 修复方案及显存预算。
-2. `P0-02`：批准建立自包含环境，确定最终 torch/transformers/diffusers/torchao 版本。
-3. `P0-03`：决定 100K 是否要求严格 data-exact resume；建议要求。
-4. 确认 Self-Flow coeff、projector 初始化、student/EMA 评估权重等有意差异。
-5. 修复已批准问题后，执行 25-shape 多机 compile/Flex 测试和 save/resume 等价测试。
-6. 完成 100–500 step 四节点真实数据 soak：坏图、checkpoint、resume、自动样图、FID、监控和故障退出全部覆盖。
-7. 只在上述门槛通过后启动正式 100K。
+1. 复核并合入本轮 `P0-01`、`P0-03`、`P1-02`、`P1-03` 和历史 checkpoint 保留修复。
+2. 明确接受 `P0-02` 暂缓期间的不可复现风险，或另行批准建立自包含环境。
+3. 确认 Self-Flow coeff、Adam betas/gradient clipping、student/EMA 评估权重等有意差异。
+4. 执行 25-shape 多机 compile/Flex 测试；本轮 save/resume correctness smoke 已完成，但未替代真实 3.86B 性能验证。
+5. 完成 100–500 step 四节点真实数据 soak：坏图、checkpoint、resume、自动样图、FID、监控和故障退出全部覆盖。
+6. 只在上述门槛通过后启动正式 100K。
 
 ## 本轮未做的事情
 
-- 未修改 BF16/FP32 精度策略。
-- 未修改 Self-Flow 公式、projector、coeff、mask semantics 或 feature shape 行为。
 - 未修改环境或依赖。
-- 未修改 resume、checkpoint 轮转、LR scheduler、评测 retention、监控和 NCCL 清理。
-- 未启动新的正式训练。
+- 未修改 Self-Flow coeff、对齐层数或 feature-shape 静默截断行为。
+- 未修改 LR scheduler、评测 retention、监控、NCCL 清理或其他未经批准的审计项。
+- 未启动新的正式训练；只运行了小模型、四卡、真实 tar 的 correctness smoke。

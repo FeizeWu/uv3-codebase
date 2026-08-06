@@ -7,9 +7,11 @@ supported but empirically correct on torch 2.12). ckpt via checkpoint.state_dict
 from __future__ import annotations
 
 import os
+import random
 import shutil
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
@@ -177,7 +179,42 @@ def apply_fsdp2(
     # shard the wrapper if it has own params
     if list(model.parameters(recurse=False)):
         fully_shard(model, mesh=dp_mesh, mp_policy=mp, reshard_after_forward=reshard_after_forward)
+    if hasattr(model, "compute_dtype"):
+        # Outside FSDP the FP32 master parameters also compute in FP32. Once
+        # wrapped, the policy casts parameters/inputs for BF16 compute while
+        # leaving the persistent parameter storage in FP32.
+        model.compute_dtype = param_dtype
     return model
+
+
+def _step_checkpoint_path(target: Path, step: int) -> Path:
+    return target.with_name(f"{target.stem}_step_{int(step):08d}{target.suffix}")
+
+
+def _validated_checkpoint_step(path: Path) -> int:
+    payload = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+    step = int(payload.get("step", -1))
+    if step < 0:
+        raise RuntimeError(f"checkpoint has invalid step: {path}")
+    return step
+
+
+def _publish_latest_pointer(target: Path, retained: Path) -> None:
+    """Atomically point ckpt.pt at an immutable step file, with a copy fallback."""
+    temporary = target.with_name(f".{target.name}.latest")
+    if os.path.lexists(temporary):
+        temporary.unlink()
+    try:
+        temporary.symlink_to(retained.name)
+        os.replace(temporary, target)
+    except OSError:
+        if os.path.lexists(temporary):
+            temporary.unlink()
+        copy_stage = target.with_name(f".{target.name}.staged")
+        shutil.copyfile(retained, copy_stage)
+        if copy_stage.stat().st_size != retained.stat().st_size:
+            raise RuntimeError(f"latest checkpoint copy size mismatch: {copy_stage}")
+        os.replace(copy_stage, target)
 
 
 def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None, extra_models=None):
@@ -192,7 +229,13 @@ def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None, ex
         name: get_model_state_dict(extra_model, options=opts)
         for name, extra_model in (extra_models or {}).items()
     }
-    rng_state = {"py": torch.get_rng_state()}
+    rng_state = {
+        # Keep the legacy key for old readers while naming all RNGs explicitly.
+        "py": torch.get_rng_state(),
+        "torch": torch.get_rng_state(),
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+    }
     if torch.cuda.is_available():
         rng_state["cuda"] = torch.cuda.get_rng_state()
     if rng is not None and hasattr(rng, "get_state"):
@@ -202,40 +245,102 @@ def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None, ex
     if dist_ok:
         rng_by_rank = [None] * torch.distributed.get_world_size() if rank0 else None
         torch.distributed.gather_object(rng_state, rng_by_rank, dst=0)
+        data_status_by_rank = [None] * torch.distributed.get_world_size() if rank0 else None
+        torch.distributed.gather_object(data_status, data_status_by_rank, dst=0)
     else:
         rng_by_rank = [rng_state]
+        data_status_by_rank = [data_status]
     if rank0:
         payload = {"model": msd, "optim": osd, "step": getattr(model, "_step", 0),
                    "rng": rng_state, "rng_by_rank": rng_by_rank,
                    "data_status": data_status,
+                   "data_status_by_rank": data_status_by_rank,
                    "extra_models": extra_model_states}
         target = Path(path)
+        step = int(payload["step"])
+        retained = _step_checkpoint_path(target, step)
         staging_root = Path(os.environ.get(
             "UV3_CKPT_STAGING_DIR", "/mnt/data/users/wfz/uv3-checkpoint-staging"
         )) / target.parent.name
         staging_root.mkdir(parents=True, exist_ok=True)
-        local_stage = staging_root / f"{target.name}.staged"
-        remote_stage = target.with_name(f".{target.name}.staged")
+        local_stage = staging_root / f"{retained.name}.staged"
+        remote_stage = retained.with_name(f".{retained.name}.staged")
         # Never overwrite the last good OSS checkpoint while serialization is
         # in progress. A SIGBUS/OSS write failure leaves either the old target
         # or a complete local recovery copy, not a truncated ckpt.pt.
-        torch.save(payload, local_stage)
-        staged = torch.load(local_stage, map_location="cpu", mmap=True, weights_only=False)
-        if int(staged.get("step", -1)) != int(payload["step"]):
-            raise RuntimeError(f"local checkpoint validation failed: {local_stage}")
-        shutil.copyfile(local_stage, remote_stage)
-        if remote_stage.stat().st_size != local_stage.stat().st_size:
-            raise RuntimeError(f"OSS checkpoint size mismatch: {remote_stage}")
-        remote = torch.load(remote_stage, map_location="cpu", mmap=True, weights_only=False)
-        if int(remote.get("step", -1)) != int(payload["step"]):
-            raise RuntimeError(f"OSS checkpoint validation failed: {remote_stage}")
-        os.replace(remote_stage, target)
-        local_stage.unlink()
+        # Preserve a pre-upgrade ckpt.pt before replacing it with a latest pointer.
+        if target.exists() and not target.is_symlink():
+            previous_step = _validated_checkpoint_step(target)
+            previous_retained = _step_checkpoint_path(target, previous_step)
+            if not previous_retained.exists():
+                shutil.copyfile(target, previous_retained)
+                if _validated_checkpoint_step(previous_retained) != previous_step:
+                    raise RuntimeError(
+                        f"failed to retain previous checkpoint: {previous_retained}"
+                    )
+        if retained.exists() and _validated_checkpoint_step(retained) == step:
+            _publish_latest_pointer(target, retained)
+        else:
+            torch.save(payload, local_stage)
+            if _validated_checkpoint_step(local_stage) != step:
+                raise RuntimeError(f"local checkpoint validation failed: {local_stage}")
+            shutil.copyfile(local_stage, remote_stage)
+            if remote_stage.stat().st_size != local_stage.stat().st_size:
+                raise RuntimeError(f"OSS checkpoint size mismatch: {remote_stage}")
+            if _validated_checkpoint_step(remote_stage) != step:
+                raise RuntimeError(f"OSS checkpoint validation failed: {remote_stage}")
+            os.replace(remote_stage, retained)
+            _publish_latest_pointer(target, retained)
+            local_stage.unlink()
     if dist_ok:
         torch.distributed.barrier()
 
 
-def load_ckpt(model, optimizers: dict, path: str, extra_models=None, return_payload=False):
+def _unwrap_self_flow_model_state(model_state: dict) -> dict:
+    student = {key[2:]: value for key, value in model_state.items() if key.startswith("0.")}
+    projector = [key for key in model_state if key.startswith("1.")]
+    unexpected = [key for key in model_state if not key.startswith(("0.", "1."))]
+    if not student or not projector or unexpected:
+        raise RuntimeError(
+            "checkpoint is not a recognized Self-Flow ModuleList layout: "
+            f"student={len(student)} projector={len(projector)} unexpected={unexpected[:3]}"
+        )
+    return student
+
+
+def _unwrap_self_flow_optimizer_state(optimizer_state: dict) -> dict:
+    state = optimizer_state.get("state", {})
+    if state and not all(isinstance(key, str) for key in state):
+        raise RuntimeError("Self-Flow optimizer conversion requires FQN-keyed state")
+    converted = {
+        key: value
+        for key, value in optimizer_state.items()
+        if key not in {"state", "param_groups"}
+    }
+    converted["state"] = {
+        key[2:]: value for key, value in state.items() if key.startswith("0.")
+    }
+    converted_groups = []
+    for original_group in optimizer_state.get("param_groups", []):
+        group = dict(original_group)
+        params = group.get("params", [])
+        if not all(isinstance(key, str) for key in params):
+            raise RuntimeError("Self-Flow optimizer conversion requires FQN param groups")
+        group["params"] = [key[2:] for key in params if key.startswith("0.")]
+        if group["params"]:
+            converted_groups.append(group)
+    converted["param_groups"] = converted_groups
+    return converted
+
+
+def load_ckpt(
+    model,
+    optimizers: dict,
+    path: str,
+    extra_models=None,
+    return_payload=False,
+    allow_self_flow_disable: bool = False,
+):
     from torch.distributed.checkpoint.state_dict import (
         set_model_state_dict, set_optimizer_state_dict, StateDictOptions,
     )
@@ -250,7 +355,10 @@ def load_ckpt(model, optimizers: dict, path: str, extra_models=None, return_payl
         cpu_offload=True,
         broadcast_from_rank0=dist_ok,
     )
-    set_model_state_dict(model, ckpt.get("model", {}), options=opts)
+    model_state = ckpt.get("model", {})
+    if allow_self_flow_disable and any(key.startswith("1.") for key in model_state):
+        model_state = _unwrap_self_flow_model_state(model_state)
+    set_model_state_dict(model, model_state, options=opts)
     saved_extra_models = ckpt.get("extra_models", {}) if rank0 else {}
     for name, extra_model in (extra_models or {}).items():
         if rank0 and name not in saved_extra_models:
@@ -258,6 +366,8 @@ def load_ckpt(model, optimizers: dict, path: str, extra_models=None, return_payl
         set_model_state_dict(extra_model, saved_extra_models.get(name, {}), options=opts)
     for k, o in optimizers.items():
         optimizer_state = ckpt.get("optim", {}).get(k, {}) if rank0 else {}
+        if allow_self_flow_disable and rank0 and optimizer_state:
+            optimizer_state = _unwrap_self_flow_optimizer_state(optimizer_state)
         # Adam has no entry for trainable parameters that never received a
         # gradient (for example dormant double-stream modules in a pure-single
         # model). Their empty state is valid and will initialize on first use.
@@ -273,6 +383,7 @@ def load_ckpt(model, optimizers: dict, path: str, extra_models=None, return_payl
         "rng": ckpt.get("rng") if rank0 else None,
         "rng_by_rank": ckpt.get("rng_by_rank") if rank0 else None,
         "data_status": ckpt.get("data_status") if rank0 else None,
+        "data_status_by_rank": ckpt.get("data_status_by_rank") if rank0 else None,
     }
     if dist_ok:
         objects = [metadata if rank0 else None]

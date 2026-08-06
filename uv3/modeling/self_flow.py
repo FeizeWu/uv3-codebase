@@ -22,11 +22,48 @@ def build_self_flow_projector(hidden_size: int, projector_dim: int | None = None
     """BFL Self-Flow SimpleHead: Linear -> SiLU -> Linear."""
     if projector_dim is None:
         projector_dim = hidden_size * 2
-    return nn.Sequential(
+    if hidden_size < 1 or projector_dim < 1:
+        raise ValueError(
+            f"Self-Flow projector dimensions must be positive, got "
+            f"hidden_size={hidden_size}, projector_dim={projector_dim}"
+        )
+    projector = nn.Sequential(
         nn.Linear(hidden_size, projector_dim),
         nn.SiLU(),
         nn.Linear(projector_dim, hidden_size),
     )
+    for module in projector.modules():
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+    return projector
+
+
+def validate_self_flow_config(config) -> None:
+    """Fail fast for Self-Flow settings that would otherwise change semantics silently."""
+    coeff = float(config.coeff)
+    decay = float(config.ema_decay)
+    mask_ratio = float(config.mask_ratio)
+    ratio = float(config.ratio)
+    projector_dim = config.projector_dim
+    if coeff < 0:
+        raise ValueError(f"self_flow.coeff must be non-negative, got {coeff}")
+    if not 0.0 <= decay < 1.0:
+        raise ValueError(f"self_flow.ema_decay must be in [0,1), got {decay}")
+    if not 0.0 <= mask_ratio <= 1.0:
+        raise ValueError(f"self_flow.mask_ratio must be in [0,1], got {mask_ratio}")
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"self_flow.ratio must be in [0,1], got {ratio}")
+    if projector_dim is not None and int(projector_dim) < 1:
+        raise ValueError(
+            f"self_flow.projector_dim must be positive or null, got {projector_dim}"
+        )
+    if config.timestep_mode not in {"independent", "ratio", "random_cleaner", "min"}:
+        raise ValueError(
+            "self_flow.timestep_mode must be independent, ratio, random_cleaner, "
+            f"or min; got {config.timestep_mode!r}"
+        )
 
 
 def self_flow_feature_loss(teacher_tokens: torch.Tensor, student_tokens: torch.Tensor) -> torch.Tensor:
@@ -162,6 +199,10 @@ def build_self_flow_latents_continuous(
     """
     b, c, h, w = clean.shape
     from .flow import interpolate
+    if patch_size < 1 or h % patch_size or w % patch_size:
+        raise ValueError(
+            f"Self-Flow patch_size={patch_size} must divide latent shape {h}x{w}"
+        )
 
     # --- timestep pairing (UniWorld train.py:297-312, continuous t) ---
     if timestep_mode == "independent":
@@ -200,9 +241,6 @@ def build_self_flow_latents_continuous(
     )
 
     from .vae import patchify_latents, unpatchify_latents
-    if mask_ratio <= 0:
-        # no mixing: student gets full t (not paired), token_timesteps all = t
-        return student_full, teacher, teacher_t, t.unsqueeze(1).expand(b, n_tok)
     s_tok = patchify_latents(student_full)
     p_tok = patchify_latents(paired)
     mask = token_mask.permute(0, 2, 1).reshape(b, 1, ph, pw)

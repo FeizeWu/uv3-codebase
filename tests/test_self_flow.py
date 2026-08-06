@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -18,7 +19,9 @@ from uv3.modeling.mmdit import MMDiT
 from uv3.modeling.flow import interpolate, velocity_target, logit_normal_timesteps
 from uv3.modeling.self_flow import (
     attach_self_flow_feature_captures,
+    build_self_flow_projector,
     build_self_flow_latents_continuous,
+    validate_self_flow_config,
 )
 
 
@@ -57,6 +60,27 @@ def test_ema_update_unsharded_parameters():
         torch.testing.assert_close(value, expected[name])
 
 
+def test_fp32_ema_tiny_updates_match_analytic_value_after_10k_steps():
+    """The 1e-4 EMA update must accumulate instead of quantizing to zero."""
+    from uv3.train.fsdp2_trainer import _ema_update_local_shards_
+
+    student = torch.nn.Linear(1, 1, bias=False).float()
+    teacher = copy.deepcopy(student)
+    with torch.no_grad():
+        student.weight.fill_(0.02)
+        teacher.weight.fill_(0.01)
+    decay = 0.9999
+    for _ in range(10_000):
+        _ema_update_local_shards_(teacher, student, decay=decay)
+    expected = 0.02 + (0.01 - 0.02) * decay**10_000
+    torch.testing.assert_close(
+        teacher.weight,
+        torch.full_like(teacher.weight, expected),
+        rtol=2e-5,
+        atol=2e-7,
+    )
+
+
 def test_pure_single_self_flow_capture():
     """A zero-double model captures aligned image tokens for Self-Flow."""
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -83,6 +107,15 @@ def test_pure_single_self_flow_capture():
     assert student_img.shape == teacher_img.shape == (batch, n_img, 256)
     student_cap.detach()
     teacher_cap.detach()
+
+
+def test_pure_single_freezes_unreachable_double_stream_modulations():
+    model = _make_model("cpu", double_layers=0, single_layers=2)
+    for module in (
+        model.transformer.double_stream_modulation_img,
+        model.transformer.double_stream_modulation_txt,
+    ):
+        assert all(not parameter.requires_grad for parameter in module.parameters())
 
 
 def test_depth_ratios_scale_to_model_depth():
@@ -142,8 +175,8 @@ def test_token_timesteps_none_zero_regression():
     assert pred.shape == noisy.shape
 
 
-def test_mask_ratio_zero_returns_student_full():
-    """mask_ratio=0 → student_latents == interpolate(clean,noise,t) (no paired contamination)."""
+def test_mask_ratio_zero_returns_all_paired_tokens():
+    """mask_ratio=0 follows UniWorld: every student token uses paired_t."""
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     clean = torch.randn(2, 32, 16, 16, device=dev)
     noise = torch.randn_like(clean)
@@ -151,13 +184,72 @@ def test_mask_ratio_zero_returns_student_full():
     student, teacher, t_teach, token_t = build_self_flow_latents_continuous(
         clean, noise, t, mask_ratio=0.0, ratio=0.5, timestep_mode="ratio",
     )
-    expected = interpolate(clean, noise, t)
+    paired_t = t * 0.5
+    expected = interpolate(clean, noise, paired_t)
     diff = (student - expected).abs().max().item()
     print(f"  mask_ratio=0 diff = {diff:.2e} (target < 1e-6)")
-    assert diff < 1e-6, f"mask_ratio=0 should return student_full, diff={diff}"
-    # token_timesteps should all be t when mask_ratio=0
-    tt_diff = (token_t - t.unsqueeze(1).expand_as(token_t)).abs().max().item()
-    assert tt_diff < 1e-6, f"token_timesteps should all be t when mask_ratio=0"
+    assert diff < 1e-6, f"mask_ratio=0 should return paired latents, diff={diff}"
+    tt_diff = (token_t - paired_t.unsqueeze(1).expand_as(token_t)).abs().max().item()
+    assert tt_diff < 1e-6, "token timesteps should all equal paired_t"
+
+
+def test_projector_honors_dimension_and_reference_initialization():
+    projector = build_self_flow_projector(8, projector_dim=13)
+    assert projector[0].weight.shape == (13, 8)
+    assert projector[2].weight.shape == (8, 13)
+    assert torch.count_nonzero(projector[0].bias) == 0
+    assert torch.count_nonzero(projector[2].bias) == 0
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("coeff", -1.0),
+        ("ema_decay", 1.0),
+        ("mask_ratio", 1.1),
+        ("ratio", -0.1),
+        ("projector_dim", 0),
+        ("timestep_mode", "typo"),
+    ],
+)
+def test_self_flow_config_validation_rejects_invalid_values(field, value):
+    config = SelfFlowConfig(enabled=True)
+    setattr(config, field, value)
+    with pytest.raises(ValueError):
+        validate_self_flow_config(config)
+
+
+def test_fp32_storage_contract_catches_bf16_ema_and_adam_moments():
+    from uv3.train.fsdp2_trainer import (
+        _assert_fp32_training_storage,
+        _cast_adam_moments_fp32_,
+    )
+
+    student = torch.nn.Linear(4, 3).float()
+    teacher = copy.deepcopy(student)
+    optimizer = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    student(torch.randn(2, 4)).sum().backward()
+    optimizer.step()
+    _assert_fp32_training_storage(
+        student, teacher, {"adam": optimizer}, require_optimizer_state=True,
+    )
+
+    frozen_teacher = copy.deepcopy(teacher).bfloat16()
+    with pytest.raises(RuntimeError, match="teacher master parameter"):
+        _assert_fp32_training_storage(
+            student, frozen_teacher, {"adam": optimizer}, require_optimizer_state=True,
+        )
+    for state in optimizer.state.values():
+        state["exp_avg"] = state["exp_avg"].bfloat16()
+        state["exp_avg_sq"] = state["exp_avg_sq"].bfloat16()
+    with pytest.raises(RuntimeError, match="optimizer adam"):
+        _assert_fp32_training_storage(
+            student, teacher, {"adam": optimizer}, require_optimizer_state=True,
+        )
+    _cast_adam_moments_fp32_({"adam": optimizer})
+    _assert_fp32_training_storage(
+        student, teacher, {"adam": optimizer}, require_optimizer_state=True,
+    )
 
 
 def test_independent_timesteps_use_min_for_teacher():
@@ -205,8 +297,10 @@ if __name__ == "__main__":
     print("  ✓ equivalence (forward_per_token == transformer.forward)")
     test_token_timesteps_none_zero_regression()
     print("  ✓ token_timesteps=None zero regression")
-    test_mask_ratio_zero_returns_student_full()
-    print("  ✓ mask_ratio=0 returns student_full")
+    test_mask_ratio_zero_returns_all_paired_tokens()
+    print("  ✓ mask_ratio=0 returns paired tokens")
+    test_projector_honors_dimension_and_reference_initialization()
+    print("  ✓ projector dimension and initialization")
     test_independent_timesteps_use_min_for_teacher()
     print("  ✓ independent timesteps and min teacher")
     test_it2i_ref_zero_timestep()

@@ -11,6 +11,7 @@ Bucketing: optionally emit compact descriptors for online joint text/aspect sche
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import random
 import threading
@@ -63,6 +64,14 @@ def _load_manifest(manifest_path: str):
     return entries
 
 
+def validate_resume_signature(saved: dict | None, current: dict) -> None:
+    if saved != current:
+        raise RuntimeError(
+            "exact data resume signature changed: "
+            f"checkpoint={saved} current={current}"
+        )
+
+
 class TarMetadataDataset(IterableDataset):
     """Stream images from tar via metadata parquet, with caption."""
 
@@ -83,35 +92,101 @@ class TarMetadataDataset(IterableDataset):
         self.aspect_buckets = tuple(aspect_buckets)
         self.defer_image_decode = bool(defer_image_decode)
         self._entries = _load_manifest(manifest_path)
+        self.manifest_digest = hashlib.sha256(
+            json.dumps(self._entries, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         self._epoch = 0
         self._resume_shard = 0
         self._resume_row = 0
+        self._resume_cursors: dict[int, dict] = {}
+        self._worker_rotation = 0
 
     def set_epoch(self, e):
         self._epoch = e
 
-    def set_resume(self, shard_pos: int, row_pos: int):
-        self._resume_shard = shard_pos
-        self._resume_row = row_pos
+    def resume_signature(
+        self,
+        world_size: int,
+        workers_per_rank: int,
+        *,
+        pipeline: dict | None = None,
+    ) -> dict:
+        signature = {
+            "manifest_digest": self.manifest_digest,
+            "manifest_entries": len(self._entries),
+            "world_size": int(world_size),
+            "workers_per_rank": int(workers_per_rank),
+            "caption_field": self.caption_field,
+            "image_size": int(self.image_size),
+            "shuffle": bool(self.shuffle),
+            "defer_image_decode": self.defer_image_decode,
+            "aspect_buckets": [
+                (bucket.name, int(bucket.width), int(bucket.height))
+                for bucket in self.aspect_buckets
+            ],
+        }
+        if pipeline is not None:
+            signature["pipeline"] = dict(pipeline)
+        return signature
+
+    def set_resume(
+        self,
+        shard_pos: int | None = None,
+        row_pos: int | None = None,
+        *,
+        worker_cursors: dict[int | str, dict] | None = None,
+        worker_rotation: int = 0,
+    ):
+        """Set a direct parquet cursor without replaying earlier samples.
+
+        ``worker_cursors`` records the last descriptor delivered to the main
+        process for each logical global worker. Resume opens that worker's
+        current parquet directly, locates the saved row group, and continues
+        after the saved filtered-row index. The positional arguments retain the
+        legacy single-cursor API for old callers.
+        """
+        if worker_cursors is not None:
+            self._resume_cursors = {
+                int(worker): dict(cursor) for worker, cursor in worker_cursors.items()
+            }
+            self._worker_rotation = int(worker_rotation)
+            return
+        self._resume_shard = int(shard_pos or 0)
+        self._resume_row = int(row_pos or 0)
 
     def __iter__(self):
         worker = get_worker_info()
-        wid, nworkers = (worker.id, worker.num_workers) if worker else (0, 1)
+        physical_wid, nworkers = (worker.id, worker.num_workers) if worker else (0, 1)
         rank, world = 0, 1
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             rank, world = torch.distributed.get_rank(), torch.distributed.get_world_size()
-        wid = rank * nworkers + wid
+        logical_local_wid = (physical_wid + self._worker_rotation) % nworkers
+        wid = rank * nworkers + logical_local_wid
         total_workers = world * nworkers
 
         # Every worker must permute shards identically *before* strided
         # partitioning.  A worker-specific permutation causes overlaps and
         # omissions across ranks even though the slice strides are disjoint.
         shard_indices = partition_shard_indices(
-            len(self._entries), self._resume_shard, self.shuffle,
+            len(self._entries), 0 if self._resume_cursors else self._resume_shard, self.shuffle,
             self._epoch, wid, total_workers,
         )
-        # Row-group order may differ per worker after shard ownership is fixed.
-        worker_rng = random.Random(5678 + self._epoch * total_workers + wid)
+        resume_cursor = self._resume_cursors.get(wid)
+        if resume_cursor is not None:
+            if int(resume_cursor.get("epoch", self._epoch)) != self._epoch:
+                raise ValueError(
+                    f"worker {wid} resume epoch {resume_cursor.get('epoch')} "
+                    f"does not match dataset epoch {self._epoch}"
+                )
+            resume_shard = int(resume_cursor["shard_pos"])
+            try:
+                shard_offset = shard_indices.index(resume_shard)
+            except ValueError as error:
+                raise ValueError(
+                    f"worker {wid} does not own resume shard {resume_shard}"
+                ) from error
+            # Directly open the saved parquet; do not replay prior shards.
+            shard_indices = shard_indices[shard_offset:]
 
         # Bound open files well below the common RLIMIT_NOFILE=1024.  The
         # manifest contains tens of thousands of tar paths, so an unbounded
@@ -124,7 +199,20 @@ class TarMetadataDataset(IterableDataset):
             pf = pq.ParquetFile(metadata_parquet)
             row_groups = list(range(pf.num_row_groups))
             if self.shuffle:
-                worker_rng.shuffle(row_groups)
+                # Per-shard seeding makes row-group order directly seekable;
+                # it does not depend on opening all preceding parquet files.
+                random.Random(
+                    5678 + self._epoch * 1_000_003 + wid * 10_007 + si_global
+                ).shuffle(row_groups)
+            if resume_cursor is not None and si_global == int(resume_cursor["shard_pos"]):
+                resume_group = int(resume_cursor["row_group"])
+                try:
+                    group_offset = row_groups.index(resume_group)
+                except ValueError as error:
+                    raise ValueError(
+                        f"resume row group {resume_group} is absent from shard {si_global}"
+                    ) from error
+                row_groups = row_groups[group_offset:]
 
             for rg in row_groups:
                 try:
@@ -138,7 +226,15 @@ class TarMetadataDataset(IterableDataset):
 
                 # resume skip (only for first shard)
                 skip = 0
-                if si_global == self._resume_shard and self._resume_row > 0:
+                if resume_cursor is not None and (
+                    si_global == int(resume_cursor["shard_pos"])
+                    and rg == int(resume_cursor["row_group"])
+                ):
+                    # Cursor is the last descriptor already handed to the
+                    # batcher, so resume at the following filtered row.
+                    skip = int(resume_cursor["row_pos"]) + 1
+                    resume_cursor = None
+                elif si_global == self._resume_shard and self._resume_row > 0:
                     skip = self._resume_row
                     self._resume_row = 0  # only skip once
 
@@ -172,7 +268,10 @@ class TarMetadataDataset(IterableDataset):
                             "offset": int(row["offset"]),
                             "size": int(row["size"]),
                             "shard_pos": si_global,
+                            "row_group": rg,
                             "row_pos": ri,
+                            "worker_id": wid,
+                            "epoch": self._epoch,
                         }
                         continue
                     # read image from tar (byte-range via seek)
@@ -205,7 +304,10 @@ class TarMetadataDataset(IterableDataset):
                         "image_height": bucket.height,
                         "image_width": bucket.width,
                         "shard_pos": si_global,
+                        "row_group": rg,
                         "row_pos": ri,
+                        "worker_id": wid,
+                        "epoch": self._epoch,
                     }
 
         for fh in tar_cache.values():

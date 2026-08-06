@@ -25,7 +25,7 @@ class ComponentConfig:
 
 @dataclass
 class SelfFlowConfig:
-    enabled: bool = True
+    enabled: bool = False
     coeff: float = 0.8                     # Self-Flow paper image setting
     # Explicit global block indices override the depth ratios when provided.
     # Ratios scale the paper's 0.3D -> 0.7D alignment to arbitrary model depths.
@@ -38,7 +38,6 @@ class SelfFlowConfig:
     mask_ratio: float = 0.25              # Self-Flow paper image setting
     ema_decay: float = 0.9999
     projector_dim: int | None = None      # None => 2*hidden
-    n_txt: int = 64                       # text token count (for img segment slicing)
 
 
 @dataclass

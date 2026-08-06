@@ -18,6 +18,7 @@ import time
 from dataclasses import asdict
 
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
@@ -33,6 +34,7 @@ from ..modeling.self_flow import (
     build_self_flow_projector,
     self_flow_feature_loss,
     build_self_flow_latents_continuous,
+    validate_self_flow_config,
 )
 from ..modeling.flow import interpolate, velocity_target
 from ..data.noise_scheduler import sample_timesteps, timestep_bin_sums
@@ -192,6 +194,49 @@ def _ema_update_local_shards_(teacher: nn.Module, student: nn.Module, decay: flo
         dst.lerp_(src, weight)
 
 
+def _assert_fp32_training_storage(
+    model: nn.Module,
+    teacher: nn.Module | None,
+    optimizers: dict[str, torch.optim.Optimizer],
+    *,
+    require_optimizer_state: bool,
+) -> None:
+    """Enforce FP32 master parameters, EMA storage, and Adam moments."""
+    for owner, module in (("student", model), ("teacher", teacher)):
+        if module is None:
+            continue
+        for name, parameter in module.named_parameters():
+            if parameter.is_floating_point() and parameter.dtype != torch.float32:
+                raise RuntimeError(
+                    f"{owner} master parameter {name} must be FP32, got {parameter.dtype}"
+                )
+    moment_count = 0
+    for optimizer_name, optimizer in optimizers.items():
+        for state in optimizer.state.values():
+            for state_name in ("exp_avg", "exp_avg_sq"):
+                value = state.get(state_name)
+                if value is None:
+                    continue
+                moment_count += 1
+                if value.dtype != torch.float32:
+                    raise RuntimeError(
+                        f"optimizer {optimizer_name} {state_name} must be FP32, "
+                        f"got {value.dtype}"
+                    )
+    if require_optimizer_state and not moment_count:
+        raise RuntimeError("optimizer has no Adam moment state after an optimizer step")
+
+
+def _cast_adam_moments_fp32_(optimizers: dict[str, torch.optim.Optimizer]) -> None:
+    """Upgrade legacy BF16 Adam moments after loading an older checkpoint."""
+    for optimizer in optimizers.values():
+        for state in optimizer.state.values():
+            for state_name in ("exp_avg", "exp_avg_sq"):
+                value = state.get(state_name)
+                if value is not None and value.dtype != torch.float32:
+                    state[state_name] = value.float()
+
+
 def _reconcile_monitor_metrics_for_resume(out_dir: str, start_step: int) -> dict:
     """Keep one monotonic metrics branch ending immediately before the checkpoint."""
     metrics_path = os.path.join(out_dir, "metrics.jsonl")
@@ -246,20 +291,25 @@ def _reconcile_monitor_metrics_for_resume(out_dir: str, start_step: int) -> dict
 class DataPrefetcher:
     """Async next batch -> device (overlap data load with compute)."""
 
-    def __init__(self, loader, dev, dtype):
+    def __init__(self, loader, dev, dtype, resume_state: dict | None = None):
         self.loader = iter(loader)
         self.dev = dev
         self.dtype = dtype
         self.stream = torch.cuda.Stream()
         self._next = None
-        self._preload()
+        self._next_cpu = None
+        restored_batch = (resume_state or {}).get("next_batch")
+        self._preload(restored_batch)
 
-    def _preload(self):
-        try:
-            batch = next(self.loader)
-        except StopIteration:
-            self._next = None
-            return
+    def _preload(self, batch=None):
+        if batch is None:
+            try:
+                batch = next(self.loader)
+            except StopIteration:
+                self._next = None
+                self._next_cpu = None
+                return
+        self._next_cpu = batch
         with torch.cuda.stream(self.stream):
             pv = batch["pixel_values"].to(self.dev, non_blocking=True).to(self.dtype)
             self._next = {"pixel_values": pv, "text": batch["text"]}
@@ -286,6 +336,24 @@ class DataPrefetcher:
                 # from pinned memory and avoids retokenization.
                 self._next["input_ids"] = batch["input_ids"]
                 self._next["attention_mask"] = batch["attention_mask"]
+
+    def state_dict(self) -> dict:
+        def cpu_clone(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            return copy.deepcopy(value)
+
+        if self._next_cpu is None:
+            return {"next_batch": None}
+        if "_resume_spec" in self._next_cpu:
+            # Online tar batches can be reconstructed from compact descriptors;
+            # do not gather decoded image tensors from every rank into rank 0.
+            return {"next_spec": copy.deepcopy(self._next_cpu["_resume_spec"])}
+        return {
+            "next_batch": {
+                key: cpu_clone(value) for key, value in self._next_cpu.items()
+            }
+        }
 
     def next(self):
         torch.cuda.current_stream().wait_stream(self.stream)
@@ -527,6 +595,10 @@ class OnlineJointBucketBatcher:
         self.peak_buffer_samples = 0
         self.decode_error_samples = 0
         self.decode_fallback_duplicate_samples = 0
+        self.source_cursors: dict[int, dict] = {}
+        self.last_source_worker_id: int | None = None
+        self._active_pending = None
+        self._restored_pending_specs = deque()
         minimum_pigeonhole_buffer = len(self._queues) * (self.batch_size - 1) + 1
         if self.max_buffer_samples < minimum_pigeonhole_buffer:
             raise ValueError(
@@ -581,6 +653,16 @@ class OnlineJointBucketBatcher:
                 f"tokenizer returned {len(encoded)} rows for {len(samples)} captions"
             )
         for sample, token_ids in zip(samples, encoded):
+            worker_id = sample.get("worker_id")
+            if worker_id is not None:
+                worker_id = int(worker_id)
+                self.source_cursors[worker_id] = {
+                    "epoch": int(sample["epoch"]),
+                    "shard_pos": int(sample["shard_pos"]),
+                    "row_group": int(sample["row_group"]),
+                    "row_pos": int(sample["row_pos"]),
+                }
+                self.last_source_worker_id = worker_id
             resolution_name = sample.get("resolution_bucket")
             if resolution_name not in self.resolution_names:
                 raise RuntimeError(
@@ -598,6 +680,56 @@ class OnlineJointBucketBatcher:
         if buffered > self.max_buffer_samples:
             raise AssertionError(f"buffer limit violated: {buffered} > {self.max_buffer_samples}")
         return True
+
+    def state_dict(self) -> dict:
+        pending = self._active_pending
+        if pending is None:
+            pending_specs = list(self._restored_pending_specs)
+        else:
+            pending_specs = [entry[0] for entry in pending]
+        return {
+            "version": 1,
+            "schedule": self._schedule,
+            "schedule_cursor": self._schedule_cursor,
+            "queues": {
+                key: list(copy.deepcopy(queue)) for key, queue in self._queues.items()
+            },
+            "pending_specs": copy.deepcopy(pending_specs),
+            "source_cursors": copy.deepcopy(self.source_cursors),
+            "last_source_worker_id": self.last_source_worker_id,
+            "source_samples": self.source_samples,
+            "emitted_samples": self.emitted_samples,
+            "promoted_samples": self.promoted_samples,
+            "peak_buffer_samples": self.peak_buffer_samples,
+            "decode_error_samples": self.decode_error_samples,
+            "decode_fallback_duplicate_samples": self.decode_fallback_duplicate_samples,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if int(state.get("version", 0)) != 1:
+            raise ValueError(f"unsupported online bucket resume version: {state.get('version')}")
+        if tuple(state.get("schedule", ())) != self._schedule:
+            raise ValueError("online bucket schedule changed since checkpoint")
+        saved_queues = state.get("queues", {})
+        if set(saved_queues) != set(self._queues):
+            raise ValueError("online bucket queue keys changed since checkpoint")
+        self._queues = {
+            key: deque(copy.deepcopy(saved_queues[key])) for key in self._queues
+        }
+        self._schedule_cursor = int(state["schedule_cursor"])
+        self._restored_pending_specs = deque(copy.deepcopy(state.get("pending_specs", [])))
+        self.source_cursors = {
+            int(worker): dict(cursor)
+            for worker, cursor in state.get("source_cursors", {}).items()
+        }
+        last_worker = state.get("last_source_worker_id")
+        self.last_source_worker_id = None if last_worker is None else int(last_worker)
+        for name in (
+            "source_samples", "emitted_samples", "promoted_samples",
+            "peak_buffer_samples", "decode_error_samples",
+            "decode_fallback_duplicate_samples",
+        ):
+            setattr(self, name, int(state.get(name, 0)))
 
     def _eligible_count(self, resolution_name, target):
         return sum(
@@ -781,6 +913,7 @@ class OnlineJointBucketBatcher:
             "bucket_decode_fallback_duplicates_cumulative": (
                 self.decode_fallback_duplicate_samples
             ),
+            "_resume_spec": spec,
         }
 
     def __iter__(self):
@@ -791,21 +924,29 @@ class OnlineJointBucketBatcher:
         pending = deque()
         source_done = False
         with ThreadPoolExecutor(max_workers=self.decode_workers) as executor:
-            while True:
-                while len(pending) < self.decode_prefetch_batches and not source_done:
-                    spec = self._select_spec(source)
-                    if spec is None:
-                        source_done = True
-                        break
-                    futures = [executor.submit(decoder, sample) for sample in spec[2]]
-                    pending.append((spec, futures))
-                if not pending:
-                    return
-                spec, futures = pending.popleft()
-                spec, pixels, decode_wait = self._decode_spec(
-                    spec, futures, source, executor, decoder,
-                )
-                yield self._materialize(spec, pixels, decode_wait)
+            for spec in self._restored_pending_specs:
+                futures = [executor.submit(decoder, sample) for sample in spec[2]]
+                pending.append((spec, futures))
+            self._restored_pending_specs.clear()
+            self._active_pending = pending
+            try:
+                while True:
+                    while len(pending) < self.decode_prefetch_batches and not source_done:
+                        spec = self._select_spec(source)
+                        if spec is None:
+                            source_done = True
+                            break
+                        futures = [executor.submit(decoder, sample) for sample in spec[2]]
+                        pending.append((spec, futures))
+                    if not pending:
+                        return
+                    spec, futures = pending.popleft()
+                    spec, pixels, decode_wait = self._decode_spec(
+                        spec, futures, source, executor, decoder,
+                    )
+                    yield self._materialize(spec, pixels, decode_wait)
+            finally:
+                self._active_pending = None
 
 
 def _align_text_to_joint_length(text, mask, image_tokens, image_token_budget):
@@ -827,7 +968,11 @@ def build(cfg: ExperimentConfig, dev, dtype):
         cfg.model.qwen_vl.pretrained, max_length=cfg.model.qwen_vl.max_length, dtype=dtype
     ).to(dev).eval()
     cfg.model.flex_attention = bool(cfg.model.flex_attention or cfg.train.flex_attention)
-    mmdit = MMDiT.build(cfg.model.transformer, cfg.model, text_encoder=qwen).to(dev, dtype=dtype)
+    # Keep trainable storage and optimizer master/moment state in FP32. FSDP2's
+    # MixedPrecisionPolicy casts only the forward/reduce path to BF16.
+    mmdit = MMDiT.build(cfg.model.transformer, cfg.model, text_encoder=qwen).to(
+        dev, dtype=torch.float32,
+    )
     return vae, qwen, mmdit
 
 
@@ -944,6 +1089,8 @@ def train(cfg: ExperimentConfig):
     dev = torch.device("cuda", local_rank)
     dtype = torch.bfloat16
     torch.manual_seed(cfg.train.seed)
+    random.seed(cfg.train.seed)
+    np.random.seed(cfg.train.seed)
 
     vae, qwen, mmdit = build(cfg, dev, dtype)
     _maybe_quantize_text_encoder_fp8(qwen, cfg, rank)
@@ -974,19 +1121,21 @@ def train(cfg: ExperimentConfig):
     sf_teacher_has_text_prefix = False
     sf_coeff = 0.0
     sf_decay = 0.99
-    sf_n_txt = 64
     sf_mask_ratio = 0.5
     sf_ratio = 0.5
     sf_timestep_mode = "ratio"
     if sf_enabled:
-        teacher = copy.deepcopy(mmdit).to(dev, dtype=dtype)
+        validate_self_flow_config(sf_cfg)
+        teacher = copy.deepcopy(mmdit).to(dev, dtype=torch.float32)
         teacher.eval()
         for p in teacher.parameters():
             p.requires_grad_(False)
-        projector = build_self_flow_projector(mmdit.inner_dim).to(dev, dtype=dtype)
+        projector = build_self_flow_projector(
+            mmdit.inner_dim,
+            projector_dim=getattr(sf_cfg, "projector_dim", None),
+        ).to(dev, dtype=torch.float32)
         sf_coeff = float(getattr(sf_cfg, "coeff", 1.0))
         sf_decay = float(getattr(sf_cfg, "ema_decay", 0.9999))
-        sf_n_txt = int(getattr(sf_cfg, "n_txt", 64))
         sf_mask_ratio = float(getattr(sf_cfg, "mask_ratio", 0.5))
         sf_ratio = float(getattr(sf_cfg, "ratio", 0.5))
         sf_timestep_mode = str(getattr(sf_cfg, "timestep_mode", "ratio"))
@@ -1018,6 +1167,8 @@ def train(cfg: ExperimentConfig):
     # Model/projector initialization must match on every rank, while training
     # noise and timestep draws must not be identical across data-parallel ranks.
     torch.manual_seed(cfg.train.seed + rank)
+    random.seed(cfg.train.seed + rank)
+    np.random.seed(cfg.train.seed + rank)
 
     _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank)
 
@@ -1055,6 +1206,11 @@ def train(cfg: ExperimentConfig):
             fully_shard(projector, mesh=mesh, mp_policy=mp, reshard_after_forward=cfg.train.reshard_after_forward)
     opt_model = nn.ModuleList([mmdit, projector]) if sf_enabled else mmdit
     optimizers, (n_m, n_a) = build_optimizers(opt_model, cfg)
+    enforce_fp32_storage = not bool(getattr(cfg.train, "mmdit_fp8", False))
+    if enforce_fp32_storage:
+        _assert_fp32_training_storage(
+            opt_model, teacher, optimizers, require_optimizer_state=False,
+        )
     if rank == 0:
         npar = sum(p.numel() for p in mmdit.parameters() if p.requires_grad)
         print(f"[train] MMDiT params={npar:,} ({npar/1e9:.2f}B) muon={n_m} adam={n_a} world={os.environ.get('WORLD_SIZE','1')}", flush=True)
@@ -1086,14 +1242,21 @@ def train(cfg: ExperimentConfig):
 
     # resume (load uses opt_model to match save's param-group keys; + RNG + data_status)
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
+    resume_ckpt_path = os.environ.get("UV3_RESUME_CKPT", ckpt_path)
+    if os.environ.get("UV3_RESUME_CKPT") and not os.path.exists(resume_ckpt_path):
+        raise FileNotFoundError(f"explicit resume checkpoint is missing: {resume_ckpt_path}")
     start_step = 0
     resumed_epoch = 0
-    if os.path.exists(ckpt_path):
+    storage_contract_checked = False
+    restored_rng = None
+    rank_data_status = None
+    if os.path.exists(resume_ckpt_path):
         try:
             start_step, resume_payload = load_ckpt(
-                opt_model, optimizers, ckpt_path,
+                opt_model, optimizers, resume_ckpt_path,
                 extra_models={"self_flow_teacher": teacher} if sf_enabled else None,
                 return_payload=True,
+                allow_self_flow_disable=not sf_enabled,
             )
             ck = resume_payload
             rank_rngs = ck.get("rng_by_rank")
@@ -1103,12 +1266,28 @@ def train(cfg: ExperimentConfig):
                 else ck.get("rng")
             )
             if restored_rng is not None:
-                torch.set_rng_state(restored_rng["py"])
+                torch.set_rng_state(restored_rng.get("torch", restored_rng["py"]))
                 if torch.cuda.is_available() and "cuda" in restored_rng:
                     torch.cuda.set_rng_state(restored_rng["cuda"])
                 if "py_gen" in restored_rng:
                     g.set_state(restored_rng["py_gen"])
-            resumed_epoch = ck.get("data_status", {}).get("epoch", 0) or 0
+                if "python" in restored_rng:
+                    random.setstate(restored_rng["python"])
+                if "numpy" in restored_rng:
+                    np.random.set_state(restored_rng["numpy"])
+            data_statuses = ck.get("data_status_by_rank")
+            rank_data_status = (
+                data_statuses[rank]
+                if data_statuses is not None and rank < len(data_statuses)
+                else ck.get("data_status")
+            ) or {}
+            resumed_epoch = rank_data_status.get("epoch", 0) or 0
+            if enforce_fp32_storage and start_step > 0:
+                _cast_adam_moments_fp32_(optimizers)
+                _assert_fp32_training_storage(
+                    opt_model, teacher, optimizers, require_optimizer_state=True,
+                )
+                storage_contract_checked = True
             if rank == 0:
                 resume_event = _reconcile_monitor_metrics_for_resume(out_dir, start_step)
                 print(f"[train] resumed from step {start_step} (epoch {resumed_epoch})", flush=True)
@@ -1119,15 +1298,24 @@ def train(cfg: ExperimentConfig):
                     f"archive={resume_event['metrics_archive']}",
                     flush=True,
                 )
-                print(
-                    "[train] WARNING: model/optimizer/per-rank RNG are exact, but "
-                    "the multi-worker text-bucket data cursor restarts at the saved epoch",
-                    flush=True,
-                )
+                if rank_data_status.get("online_joint"):
+                    print(
+                        "[train] exact online data resume state found: per-worker "
+                        "parquet cursors + bucket queues + decode/prefetch pending",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[train] WARNING: this checkpoint has no exact online data "
+                        "pipeline state; non-production/legacy data order may restart",
+                        flush=True,
+                    )
         except Exception as e:
             if rank == 0:
                 print(f"[train] resume failed ({type(e).__name__}: {e})", flush=True)
-            raise RuntimeError(f"refusing to start fresh after checkpoint load failure: {ckpt_path}") from e
+            raise RuntimeError(
+                f"refusing to start fresh after checkpoint load failure: {resume_ckpt_path}"
+            ) from e
 
     from ..data.bucket_sampler import build_aspect_buckets
     aspect_buckets = ()
@@ -1167,9 +1355,27 @@ def train(cfg: ExperimentConfig):
                 flush=True,
             )
 
+    text_buckets = tuple(int(x) for x in getattr(cfg.train, "text_length_buckets", ()))
+    pad_text_to_max = bool(getattr(cfg.train, "pad_text_to_max_length", True))
+    text_bucket_weights = tuple(
+        int(x) for x in getattr(cfg.train, "text_length_bucket_weights", ())
+    ) if text_buckets else ()
+    online_pipeline_signature = {
+        "batch_size_per_gpu": int(cfg.train.batch_size_per_gpu),
+        "text_buckets": list(text_buckets),
+        "text_bucket_weights": list(text_bucket_weights),
+        "tokenize_batch_size": int(getattr(cfg.data, "tokenize_batch_size", 256)),
+        "bucket_buffer_max_samples": int(
+            getattr(cfg.data, "bucket_buffer_max_samples", 8192)
+        ),
+        "tokenizer_pretrained": str(cfg.model.qwen_vl.pretrained),
+        "tokenizer_max_length": int(cfg.model.qwen_vl.max_length),
+    }
+
     # data: TarMetadataDataset (real data) or ParquetImageDataset (imagenet smoke)
+    online_resume_state = None
     if cfg.data.dataset == "tar":
-        from ..data.tar_dataset import TarMetadataDataset
+        from ..data.tar_dataset import TarMetadataDataset, validate_resume_signature
         ds = TarMetadataDataset(
             manifest_path=cfg.data.root,  # manifest path stored in root
             image_size=cfg.data.image_size,
@@ -1178,6 +1384,33 @@ def train(cfg: ExperimentConfig):
             defer_image_decode=online_joint_bucketing,
         )
         ds.set_epoch(resumed_epoch)
+        online_resume_state = (
+            rank_data_status.get("online_joint") if rank_data_status else None
+        )
+        if start_step > 0 and online_joint_bucketing:
+            if online_resume_state is None:
+                raise RuntimeError(
+                    "checkpoint predates exact online data resume state; refusing to "
+                    "silently repeat the epoch prefix"
+                )
+            saved_signature = rank_data_status.get("data_signature")
+            current_signature = ds.resume_signature(
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized() else 1,
+                cfg.data.num_workers,
+                pipeline=online_pipeline_signature,
+            )
+            validate_resume_signature(saved_signature, current_signature)
+            batcher_resume = online_resume_state["batcher"]
+            last_worker = batcher_resume.get("last_source_worker_id")
+            worker_rotation = (
+                0 if last_worker is None
+                else (int(last_worker) + 1) % max(1, cfg.data.num_workers)
+            )
+            ds.set_resume(
+                worker_cursors=batcher_resume.get("source_cursors", {}),
+                worker_rotation=worker_rotation,
+            )
     elif cfg.data.dataset == "fixed_tar":
         from ..data.fixed_tar_dataset import FixedTarSampleDataset
         # Small fixed sets are repeatedly buffered by text-length bucket. The
@@ -1199,15 +1432,18 @@ def train(cfg: ExperimentConfig):
             aspect_buckets=aspect_buckets,
         )
         ds.set_epoch(resumed_epoch)
-    text_buckets = tuple(int(x) for x in getattr(cfg.train, "text_length_buckets", ()))
-    pad_text_to_max = bool(getattr(cfg.train, "pad_text_to_max_length", True))
-    text_bucket_weights = tuple(
-        int(x) for x in getattr(cfg.train, "text_length_bucket_weights", ())
-    ) if text_buckets else ()
+    data_loader_generator = torch.Generator().manual_seed(
+        cfg.train.seed + rank + 10_000
+    )
     if online_joint_bucketing:
         if not text_buckets:
             raise ValueError("online joint bucketing requires text_length_buckets")
-        sample_loader = DataLoader(ds, batch_size=None, num_workers=cfg.data.num_workers)
+        sample_loader = DataLoader(
+            ds,
+            batch_size=None,
+            num_workers=cfg.data.num_workers,
+            generator=data_loader_generator,
+        )
         loader = OnlineJointBucketBatcher(
             sample_loader,
             qwen.tokenizer,
@@ -1220,6 +1456,8 @@ def train(cfg: ExperimentConfig):
             decode_workers=getattr(cfg.data, "decode_workers", cfg.data.num_workers),
             decode_prefetch_batches=getattr(cfg.data, "decode_prefetch_batches", 2),
         )
+        if online_resume_state is not None:
+            loader.load_state_dict(online_resume_state["batcher"])
         if rank == 0:
             print(
                 f"[train] online joint bucketing ON: text={text_buckets} "
@@ -1230,7 +1468,12 @@ def train(cfg: ExperimentConfig):
                 flush=True,
             )
     elif text_buckets or aspect_buckets:
-        sample_loader = DataLoader(ds, batch_size=None, num_workers=cfg.data.num_workers)
+        sample_loader = DataLoader(
+            ds,
+            batch_size=None,
+            num_workers=cfg.data.num_workers,
+            generator=data_loader_generator,
+        )
         loader = LengthBucketBatcher(
             sample_loader,
             qwen.tokenizer,
@@ -1253,8 +1496,47 @@ def train(cfg: ExperimentConfig):
             batch_size=cfg.train.batch_size_per_gpu,
             num_workers=cfg.data.num_workers,
             drop_last=True,
+            generator=data_loader_generator,
         )
-    prefetcher = DataPrefetcher(loader, dev, dtype)
+    prefetcher = DataPrefetcher(
+        loader,
+        dev,
+        dtype,
+        resume_state=(online_resume_state or {}).get("prefetcher"),
+    )
+    # DataLoader iterator creation consumes torch RNG for worker base seeds.
+    # Restore checkpoint RNG again after rebuilding the exact data pipeline so
+    # the next timestep/noise/Self-Flow mask draw matches uninterrupted training.
+    if restored_rng is not None:
+        torch.set_rng_state(restored_rng.get("torch", restored_rng["py"]))
+        if torch.cuda.is_available() and "cuda" in restored_rng:
+            torch.cuda.set_rng_state(restored_rng["cuda"])
+        if "py_gen" in restored_rng:
+            g.set_state(restored_rng["py_gen"])
+        if "python" in restored_rng:
+            random.setstate(restored_rng["python"])
+        if "numpy" in restored_rng:
+            np.random.set_state(restored_rng["numpy"])
+
+    def capture_data_status(completed_step: int) -> dict:
+        status = {"version": 1, "epoch": resumed_epoch, "step": int(completed_step)}
+        if online_joint_bucketing:
+            status["data_signature"] = ds.resume_signature(
+                world_size, cfg.data.num_workers,
+                pipeline=online_pipeline_signature,
+            )
+            batcher_state = loader.state_dict()
+            prefetcher_state = prefetcher.state_dict()
+            next_spec = prefetcher_state.pop("next_spec", None)
+            if next_spec is not None:
+                # The batcher has already yielded this spec to DataPrefetcher,
+                # so put it back ahead of decode-pending specs for resume.
+                batcher_state["pending_specs"].insert(0, next_spec)
+            status["online_joint"] = {
+                "batcher": batcher_state,
+                "prefetcher": prefetcher_state,
+            }
+        return status
     timer = Timer()
 
     bs = cfg.train.batch_size_per_gpu
@@ -1459,7 +1741,7 @@ def train(cfg: ExperimentConfig):
             student_latents, teach_lat, t_teach, token_t = build_self_flow_latents_continuous(
                 latents, noise, t,
                 mask_ratio=sf_mask_ratio, ratio=sf_ratio, timestep_mode=sf_timestep_mode,
-                paired_t=paired_t,
+                paired_t=paired_t, patch_size=cfg.model.patch_size,
             )
             # Student capture is an image-only double stream, or a full
             # [text, image] sequence when the architecture is pure-single.
@@ -1532,6 +1814,11 @@ def train(cfg: ExperimentConfig):
             profile_mark("grad_clip")
             for o in optimizers.values():
                 o.step()                                             # optimizer
+            if enforce_fp32_storage and not storage_contract_checked:
+                _assert_fp32_training_storage(
+                    opt_model, teacher, optimizers, require_optimizer_state=True,
+                )
+                storage_contract_checked = True
             profile_mark("optimizer")
             if fp8_precompute_scale:
                 precompute_float8_dynamic_scale_for_fsdp(mmdit)
@@ -1709,7 +1996,7 @@ def train(cfg: ExperimentConfig):
             opt_model._step = completed_steps
             save_ckpt(
                 opt_model, optimizers, ckpt_path, rng=g,
-                data_status={"epoch": resumed_epoch, "step": completed_steps},
+                data_status=capture_data_status(completed_steps),
                 extra_models={"self_flow_teacher": teacher} if sf_enabled else None,
             )
             if rank == 0:
@@ -1720,7 +2007,7 @@ def train(cfg: ExperimentConfig):
         opt_model._step = step
         save_ckpt(
             opt_model, optimizers, ckpt_path, rng=g,
-            data_status={"epoch": resumed_epoch, "step": step},
+            data_status=capture_data_status(step),
             extra_models={"self_flow_teacher": teacher} if sf_enabled else None,
         )
     if rank == 0:

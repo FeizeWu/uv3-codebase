@@ -1,0 +1,71 @@
+model:
+  architecture: mmdit
+  hidden_size: 256
+  num_layers: 0
+  num_double_layers: 0
+  num_single_layers: 2
+  num_heads: 4
+  latent_channels: 32
+  patch_size: 2
+  rope_theta: 2000.0
+  guidance_embeds: false
+  flex_attention: false
+  alpha_on: false
+  vae: {backend: diffusers, pretrained: /mnt/data/users/wfz/checkpoints/black-forest-labs/FLUX.2-dev, subfolder: vae, trainable: false}
+  qwen_vl: {backend: transformers, pretrained: /mnt/data/share/checkpoints/Qwen/Qwen3.5-4B, trainable: false, max_length: 1024}
+  transformer: {backend: random, trainable: true}
+  self_flow:
+    enabled: true
+    coeff: 0.8
+    ema_decay: 0.9999
+    student_depth: 0
+    teacher_depth: 1
+    mask_ratio: 0.25
+    timestep_mode: independent
+    projector_dim: 384
+data:
+  dataset: tar
+  root: /mnt/oss/uv3-pretrain-manifect/0803-test/eval-v1/train_manifest.jsonl
+  image_size: 256
+  bucket: true
+  aspect_buckets: [square, landscape, portrait, widescreen, phone]
+  resolution_stride: 16
+  online_joint_bucketing: true
+  tokenize_batch_size: 32
+  bucket_buffer_max_samples: 256
+  decode_workers: 2
+  decode_prefetch_batches: 2
+  caption_field: caption_qwen3_7_flash
+  num_workers: 4
+train:
+  fsdp2: true
+  num_replicate: 1
+  num_shard: 4
+  reshard_after_forward: true
+  mixed_precision: bf16
+  compile: false
+  text_length_buckets: [512, 640, 768, 896, 1024]
+  text_length_bucket_weights: [20, 18, 18, 14, 30]
+  pad_text_to_max_length: false
+  flex_attention: false
+  block_size: 128
+  batch_size_per_gpu: 2
+  grad_accum: 1
+  max_steps: 4
+  grad_clip: 1.0
+  ckpt_every: 2
+  output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
+  run_name: smoke_exact_resume
+  monitor_enabled: false
+  log_every: 1
+  seed: 42
+  timestep_strategy: logit_normal
+  timestep_logit_mean: 0.0
+  timestep_logit_std: 1.0
+  optimizer:
+    optimizer: adamw
+    adam_lr: 1.0e-4
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    adam_weight_decay: 0.0
+    adam_fused: false

@@ -73,6 +73,17 @@ class MMDiT(nn.Module):
         self.latent_channels = latent_channels   # 32
         self.inner_dim = transformer.config.num_attention_heads * transformer.config.attention_head_dim
         self._flex = flex_attention
+        self.compute_dtype: torch.dtype | None = None
+        if not transformer.transformer_blocks:
+            # Diffusers still constructs double-stream modulation weights for a
+            # pure-single model, but no forward path can reach them. Keeping
+            # them trainable creates empty/zero Adam state only after resume and
+            # breaks optimizer-state equivalence without changing the model.
+            for module in (
+                transformer.double_stream_modulation_img,
+                transformer.double_stream_modulation_txt,
+            ):
+                module.requires_grad_(False)
         if flex_attention:
             from .flex_mmdit import set_flex_attn
             set_flex_attn(self, enable=True)
@@ -112,7 +123,7 @@ class MMDiT(nn.Module):
 
     @property
     def dtype(self):
-        return next(self.transformer.parameters()).dtype
+        return self.compute_dtype or next(self.transformer.parameters()).dtype
 
     def forward(self, noisy, text, timesteps, **kwargs):
         """Compiled training entry point; delegates to velocity prediction."""
