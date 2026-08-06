@@ -70,8 +70,13 @@ class DataConfig:
     image_field: str = "image"
     caption_field: str = "text"
     image_size: int = 256
-    bucket: bool = True                    # resolution bucketing
-    aspect_buckets: str = "mar_256"
+    bucket: bool = False                   # group batches by source aspect ratio
+    # Equal-area profiles from uv3.data.bucket_sampler. ``mar_256`` remains an
+    # alias for this five-bucket preset for old configs.
+    aspect_buckets: tuple[str, ...] = (
+        "square", "landscape", "portrait", "widescreen", "phone",
+    )
+    aspect_bucket_weights: tuple[int, ...] = ()
     resolution_stride: int = 16
     alpha: bool = True                     # preserve RGBA else pad ones
     it2i_mix: float = 0.0                  # 0 = pure t2i; >0 = fraction of edit pairs

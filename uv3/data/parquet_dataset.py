@@ -5,14 +5,17 @@ Supports overfit_n: take the first N images and repeat (deterministic overfit se
 """
 from __future__ import annotations
 
+import io
 import random
 from pathlib import Path
 
 import pyarrow.parquet as pq
 import torch
+from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
 
-from .transforms import decode_image
+from .bucket_sampler import AspectBucket, choose_aspect_bucket
+from .transforms import pil_to_tensor
 
 # ImageNet 1k class names are huge; for overfit/efficiency we use a generic prompt keyed by label.
 _PROMPT = "a photo of class {label}"
@@ -28,6 +31,7 @@ class ParquetImageDataset(IterableDataset):
         overfit_n: int | None = None,
         image_field: str = "image",
         label_field: str = "label",
+        aspect_buckets: tuple[AspectBucket, ...] = (),
     ):
         super().__init__()
         data_dir = Path(root)
@@ -39,6 +43,7 @@ class ParquetImageDataset(IterableDataset):
         self.overfit_n = overfit_n
         self.image_field = image_field
         self.label_field = label_field
+        self.aspect_buckets = tuple(aspect_buckets)
         self._epoch = 0
 
     def set_epoch(self, epoch: int):
@@ -87,8 +92,20 @@ class ParquetImageDataset(IterableDataset):
         if isinstance(img, dict):
             img = img.get("bytes")
         label = int(row[self.label_field])
+        image = Image.open(io.BytesIO(img)).convert("RGB")
+        if self.aspect_buckets:
+            bucket = choose_aspect_bucket(image.width, image.height, self.aspect_buckets)
+        else:
+            bucket = AspectBucket(
+                name="square",
+                width=self.image_size,
+                height=self.image_size,
+            )
         return {
-            "pixel_values": decode_image(img, self.image_size),
+            "pixel_values": pil_to_tensor(image, (bucket.height, bucket.width)),
             "text": _PROMPT.format(label=label),
             "label": label,
+            "resolution_bucket": bucket.name,
+            "image_height": bucket.height,
+            "image_width": bucket.width,
         }

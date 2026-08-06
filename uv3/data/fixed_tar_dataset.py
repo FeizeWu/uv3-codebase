@@ -9,14 +9,22 @@ import torch
 from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
 
-from .transforms import center_crop_resize
+from .bucket_sampler import AspectBucket, choose_aspect_bucket
+from .transforms import pil_to_tensor
 
 
 class FixedTarSampleDataset(IterableDataset):
-    def __init__(self, cases_path: str, image_size: int = 256, shuffle: bool = True):
+    def __init__(
+        self,
+        cases_path: str,
+        image_size: int = 256,
+        shuffle: bool = True,
+        aspect_buckets: tuple[AspectBucket, ...] = (),
+    ):
         super().__init__()
         self.image_size = image_size
         self.shuffle = shuffle
+        self.aspect_buckets = tuple(aspect_buckets)
         with open(cases_path, encoding="utf-8") as file:
             self.cases = [json.loads(line) for line in file if line.strip()]
         if not self.cases:
@@ -60,18 +68,28 @@ class FixedTarSampleDataset(IterableDataset):
                         file.seek(case["offset"])
                         raw = file.read(case["size"])
                         image = Image.open(io.BytesIO(raw)).convert("RGB")
-                        image = center_crop_resize(image, self.image_size)
-                        pixels = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
-                        pixels = (
-                            pixels.reshape(self.image_size, self.image_size, 3)
-                            .permute(2, 0, 1).float().div(127.5).sub(1.0)
-                        )
+                        if self.aspect_buckets:
+                            bucket = choose_aspect_bucket(
+                                int(case.get("width") or image.width),
+                                int(case.get("height") or image.height),
+                                self.aspect_buckets,
+                            )
+                        else:
+                            bucket = AspectBucket(
+                                name="square",
+                                width=self.image_size,
+                                height=self.image_size,
+                            )
+                        pixels = pil_to_tensor(image, (bucket.height, bucket.width))
                     except Exception:
                         continue
                     yield {
                         "pixel_values": pixels,
                         "text": case["caption"],
                         "case_id": case["case_id"],
+                        "resolution_bucket": bucket.name,
+                        "image_height": bucket.height,
+                        "image_width": bucket.width,
                     }
                 cycle += 1
         finally:

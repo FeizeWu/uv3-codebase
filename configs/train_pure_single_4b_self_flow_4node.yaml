@@ -31,6 +31,13 @@ data:
   # Shard-level split; eval-v1 holdout shards are never read by training.
   root: /mnt/oss/uv3-pretrain-manifect/0803-test/eval-v1/train_manifest.jsonl
   image_size: 256
+  # Keep roughly 256^2 pixels while preserving common source aspect ratios.
+  # Weights are percentages from a 432,687-row sample of this manifest
+  # (2026-08-06); matching the source distribution bounds queue growth.
+  bucket: true
+  aspect_buckets: [square, landscape, portrait, widescreen, phone]
+  aspect_bucket_weights: [19, 37, 14, 26, 4]
+  resolution_stride: 16
   caption_field: caption_qwen3_7_flash
   num_workers: 4
 train:

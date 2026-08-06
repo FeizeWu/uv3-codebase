@@ -20,7 +20,8 @@ import torch
 from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
 
-from .transforms import center_crop_resize
+from .bucket_sampler import AspectBucket, choose_aspect_bucket
+from .transforms import pil_to_tensor
 
 
 MANIFEST_PATH = "/mnt/oss/uv3-pretrain-manifect/0803-test/manifect.jsonl"
@@ -56,13 +57,20 @@ def _load_manifest(manifest_path: str):
 class TarMetadataDataset(IterableDataset):
     """Stream images from tar via metadata parquet, with caption."""
 
-    def __init__(self, manifest_path: str = MANIFEST_PATH, image_size: int = 256,
-                 caption_field: str = CAPTION_FIELD, shuffle: bool = True):
+    def __init__(
+        self,
+        manifest_path: str = MANIFEST_PATH,
+        image_size: int = 256,
+        caption_field: str = CAPTION_FIELD,
+        shuffle: bool = True,
+        aspect_buckets: tuple[AspectBucket, ...] = (),
+    ):
         super().__init__()
         self.manifest_path = manifest_path
         self.image_size = image_size
         self.caption_field = caption_field
         self.shuffle = shuffle
+        self.aspect_buckets = tuple(aspect_buckets)
         self._entries = _load_manifest(manifest_path)
         self._epoch = 0
         self._resume_shard = 0
@@ -139,9 +147,19 @@ class TarMetadataDataset(IterableDataset):
                         fh.seek(row["offset"])
                         raw = fh.read(row["size"])
                         img = Image.open(io.BytesIO(raw)).convert("RGB")
-                        img = center_crop_resize(img, self.image_size)
-                        arr = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
-                        arr = arr.reshape(self.image_size, self.image_size, 3).permute(2, 0, 1).float().div(127.5).sub(1.0)
+                        source_width = int(row.get("width") or img.width)
+                        source_height = int(row.get("height") or img.height)
+                        if self.aspect_buckets:
+                            bucket = choose_aspect_bucket(
+                                source_width, source_height, self.aspect_buckets,
+                            )
+                        else:
+                            bucket = AspectBucket(
+                                name="square",
+                                width=self.image_size,
+                                height=self.image_size,
+                            )
+                        arr = pil_to_tensor(img, (bucket.height, bucket.width))
                     except Exception:
                         continue
 
@@ -149,6 +167,9 @@ class TarMetadataDataset(IterableDataset):
                     yield {
                         "pixel_values": arr,
                         "text": caption,
+                        "resolution_bucket": bucket.name,
+                        "image_height": bucket.height,
+                        "image_width": bucket.width,
                         "shard_pos": si_global,
                         "row_pos": ri,
                     }

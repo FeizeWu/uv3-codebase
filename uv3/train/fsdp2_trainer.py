@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import itertools
 import json
 import os
 import random
@@ -48,13 +47,21 @@ from ..utils.timer import Timer
 
 
 def _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank):
-    """Compile fixed-shape MMDiT calls and the frozen Qwen backbone before FSDP2."""
+    """Compile one static graph per configured text/resolution bucket."""
     if not cfg.train.compile:
         return
     text_buckets = tuple(int(x) for x in getattr(cfg.train, "text_length_buckets", ()))
+    if bool(getattr(cfg.data, "bucket", False)):
+        from ..data.bucket_sampler import normalize_bucket_names
+        resolution_bucket_count = len(
+            normalize_bucket_names(getattr(cfg.data, "aspect_buckets", ()))
+        )
+    else:
+        resolution_bucket_count = 1
     pad_text_to_max = bool(getattr(cfg.train, "pad_text_to_max_length", True))
     recompile_limit = "default"
-    if text_buckets:
+    static_graph_count = max(1, len(text_buckets)) * max(1, resolution_bucket_count)
+    if static_graph_count > 1:
         # Qwen's hybrid linear/full-attention stack creates more than one guarded
         # frame per sequence length (including bool/long internal mask variants).
         # The default limit of 8 makes a five-bucket run silently fall back to
@@ -62,7 +69,7 @@ def _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank):
         from torch import _dynamo
         _dynamo.config.recompile_limit = max(
             int(_dynamo.config.recompile_limit),
-            16 * len(text_buckets),
+            16 * static_graph_count,
         )
         recompile_limit = _dynamo.config.recompile_limit
     mmdit_compile_mode = str(getattr(cfg.train, "compile_mode", "default"))
@@ -94,6 +101,7 @@ def _compile_training_modules(vae, mmdit, qwen, teacher, cfg, rank):
               f"vae={compile_vae} "
               f"vae_mode={str(getattr(cfg.train, 'vae_compile_mode', 'default')) if compile_vae else 'off'} "
               f"mmdit_text_buckets={bool(text_buckets) and not pad_text_to_max} "
+              f"resolution_buckets={resolution_bucket_count} "
               f"dynamic=False mmdit_mode={mmdit_compile_mode} "
               f"text_mode={text_compile_mode} "
               f"recompile_limit={recompile_limit}", flush=True)
@@ -222,6 +230,9 @@ class DataPrefetcher:
         with torch.cuda.stream(self.stream):
             pv = batch["pixel_values"].to(self.dev, non_blocking=True).to(self.dtype)
             self._next = {"pixel_values": pv, "text": batch["text"]}
+            for key in ("resolution_bucket", "image_height", "image_width"):
+                if key in batch:
+                    self._next[key] = batch[key]
             if "text_bucket_length" in batch:
                 self._next["text_bucket_length"] = batch["text_bucket_length"]
             if "input_ids" in batch:
@@ -241,25 +252,67 @@ class DataPrefetcher:
 
 
 class LengthBucketBatcher:
-    """Form full batches with one static text length, identically scheduled per rank."""
+    """Form static text-length/resolution batches on an identical rank schedule."""
 
-    def __init__(self, loader, tokenizer, batch_size, buckets, weights):
+    def __init__(
+        self,
+        loader,
+        tokenizer,
+        batch_size,
+        buckets=(),
+        weights=(),
+        resolution_buckets=(),
+        resolution_weights=(),
+        max_queue_batches=8,
+    ):
         self.loader = loader
         self.tokenizer = tokenizer
         self.batch_size = int(batch_size)
         self.buckets = tuple(int(x) for x in buckets)
         self.weights = tuple(int(x) for x in weights)
+        self.resolution_buckets = tuple(resolution_buckets)
+        self.resolution_names = tuple(bucket.name for bucket in self.resolution_buckets)
+        self.resolution_weights = tuple(int(x) for x in resolution_weights)
+        self.max_queue_samples = max(1, int(max_queue_batches)) * self.batch_size
         self._slot = 0
+        self._schedule_cursor = 0
         self._token_buffers = {}
-        if not self.buckets or tuple(sorted(self.buckets)) != self.buckets:
-            raise ValueError(f"text_length_buckets must be sorted and non-empty: {self.buckets}")
-        if len(self.weights) != len(self.buckets) or any(x < 1 for x in self.weights):
+        self.dropped_samples = 0
+        if self.buckets and tuple(sorted(self.buckets)) != self.buckets:
+            raise ValueError(f"text_length_buckets must be sorted: {self.buckets}")
+        if self.buckets and (
+            len(self.weights) != len(self.buckets) or any(x < 1 for x in self.weights)
+        ):
             raise ValueError(
                 "text_length_bucket_weights must contain one positive integer "
                 f"per bucket: buckets={self.buckets}, weights={self.weights}"
             )
+        if self.resolution_buckets and (
+            len(self.resolution_weights) != len(self.resolution_buckets)
+            or any(x < 1 for x in self.resolution_weights)
+        ):
+            raise ValueError(
+                "aspect_bucket_weights must contain one positive integer per "
+                f"bucket: buckets={self.resolution_names}, weights={self.resolution_weights}"
+            )
+        if not self.buckets and not self.resolution_buckets:
+            raise ValueError("LengthBucketBatcher requires text or resolution buckets")
+
+        text_schedule = tuple(zip(self.buckets, self.weights)) or ((None, 1),)
+        resolution_schedule = (
+            tuple(zip(self.resolution_names, self.resolution_weights)) or ((None, 1),)
+        )
+        self._schedule = [
+            (resolution_name, text_length)
+            for resolution_name, resolution_weight in resolution_schedule
+            for text_length, text_weight in text_schedule
+            for _ in range(resolution_weight * text_weight)
+        ]
+        random.Random(0).shuffle(self._schedule)
 
     def _tokenize_for_bucket(self, text):
+        if not self.buckets:
+            return None, None
         token_ids = self.tokenizer(
             text,
             add_special_tokens=True,
@@ -270,28 +323,39 @@ class LengthBucketBatcher:
         bucket = next((bucket for bucket in self.buckets if length <= bucket), self.buckets[-1])
         return bucket, torch.tensor(token_ids, dtype=torch.long)
 
+    def _next_target(self):
+        target = self._schedule[self._schedule_cursor % len(self._schedule)]
+        self._schedule_cursor += 1
+        return target
+
     def __iter__(self):
-        queues = {bucket: [] for bucket in self.buckets}
-        schedule = [
-            bucket
-            for bucket, weight in zip(self.buckets, self.weights)
-            for _ in range(weight)
-        ]
-        # Same seed on every rank keeps the bucket/compile-graph order identical,
-        # while shuffling avoids long runs of one bucket filling other queues.
-        random.Random(0).shuffle(schedule)
-        targets = itertools.cycle(schedule)
+        queues = {target: [] for target in set(self._schedule)}
         source = iter(self.loader)
         while True:
-            target = next(targets)
+            target = self._next_target()
             while len(queues[target]) < self.batch_size:
                 try:
                     sample = next(source)
                 except StopIteration:
                     return
-                bucket, input_ids = self._tokenize_for_bucket(sample["text"])
-                sample["input_ids"] = input_ids
-                queues[bucket].append(sample)
+                text_bucket, input_ids = self._tokenize_for_bucket(sample["text"])
+                if input_ids is not None:
+                    sample["input_ids"] = input_ids
+                resolution_bucket = (
+                    sample.get("resolution_bucket") if self.resolution_buckets else None
+                )
+                key = (resolution_bucket, text_bucket)
+                if key not in queues:
+                    raise RuntimeError(
+                        f"dataset emitted unscheduled bucket {key}; "
+                        f"known={sorted(queues, key=str)}"
+                    )
+                queue = queues[key]
+                queue.append(sample)
+                if len(queue) > self.max_queue_samples:
+                    overflow = len(queue) - self.max_queue_samples
+                    del queue[:overflow]
+                    self.dropped_samples += overflow
             samples = queues[target][:self.batch_size]
             del queues[target][:self.batch_size]
             pin_memory = torch.cuda.is_available()
@@ -304,37 +368,45 @@ class LengthBucketBatcher:
             pixel_values = torch.stack(
                 [sample["pixel_values"] for sample in samples]
             )
-            token_key = (slot, target)
-            buffers = self._token_buffers.get(token_key)
-            if buffers is None:
-                buffers = (
-                    torch.empty(
-                        (self.batch_size, target),
-                        dtype=torch.long,
-                        pin_memory=pin_memory,
-                    ),
-                    torch.empty(
-                        (self.batch_size, target),
-                        dtype=torch.long,
-                        pin_memory=pin_memory,
-                    ),
-                )
-                self._token_buffers[token_key] = buffers
-            input_ids, attention_mask = buffers
-            input_ids.fill_(int(self.tokenizer.pad_token_id))
-            attention_mask.zero_()
-            for index, sample in enumerate(samples):
-                ids = sample["input_ids"]
-                length = ids.numel()
-                input_ids[index, :length].copy_(ids)
-                attention_mask[index, :length] = 1
-            yield {
+            resolution_name, text_target = target
+            batch = {
                 "pixel_values": pixel_values,
                 "text": [sample["text"] for sample in samples],
-                "text_bucket_length": target,
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
+                "resolution_bucket": resolution_name or samples[0].get("resolution_bucket", "square"),
+                "image_height": int(pixel_values.shape[-2]),
+                "image_width": int(pixel_values.shape[-1]),
             }
+            if text_target is not None:
+                token_key = (slot, text_target)
+                buffers = self._token_buffers.get(token_key)
+                if buffers is None:
+                    buffers = (
+                        torch.empty(
+                            (self.batch_size, text_target),
+                            dtype=torch.long,
+                            pin_memory=pin_memory,
+                        ),
+                        torch.empty(
+                            (self.batch_size, text_target),
+                            dtype=torch.long,
+                            pin_memory=pin_memory,
+                        ),
+                    )
+                    self._token_buffers[token_key] = buffers
+                input_ids, attention_mask = buffers
+                input_ids.fill_(int(self.tokenizer.pad_token_id))
+                attention_mask.zero_()
+                for index, sample in enumerate(samples):
+                    ids = sample["input_ids"]
+                    length = ids.numel()
+                    input_ids[index, :length].copy_(ids)
+                    attention_mask[index, :length] = 1
+                batch.update({
+                    "text_bucket_length": text_target,
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                })
+            yield batch
 
 
 def build(cfg: ExperimentConfig, dev, dtype):
@@ -631,6 +703,38 @@ def train(cfg: ExperimentConfig):
                 print(f"[train] resume failed ({type(e).__name__}: {e})", flush=True)
             raise RuntimeError(f"refusing to start fresh after checkpoint load failure: {ckpt_path}") from e
 
+    from ..data.bucket_sampler import build_aspect_buckets
+    aspect_buckets = ()
+    aspect_weights = ()
+    if bool(getattr(cfg.data, "bucket", False)):
+        aspect_buckets = build_aspect_buckets(
+            cfg.data.image_size,
+            getattr(cfg.data, "aspect_buckets", ()),
+            getattr(cfg.data, "resolution_stride", 16),
+        )
+        if not aspect_buckets:
+            raise ValueError("data.bucket=true requires at least one aspect bucket")
+        configured_weights = tuple(
+            int(x) for x in getattr(cfg.data, "aspect_bucket_weights", ())
+        )
+        aspect_weights = configured_weights or (1,) * len(aspect_buckets)
+        if len(aspect_weights) != len(aspect_buckets) or any(x < 1 for x in aspect_weights):
+            raise ValueError(
+                "data.aspect_bucket_weights must contain one positive integer "
+                f"per bucket: buckets={[bucket.name for bucket in aspect_buckets]} "
+                f"weights={aspect_weights}"
+            )
+        if rank == 0:
+            print(
+                "[train] resolution buckets="
+                + ", ".join(
+                    f"{bucket.name}:{bucket.width}x{bucket.height}"
+                    f"/{bucket.image_tokens}tok/w{weight}"
+                    for bucket, weight in zip(aspect_buckets, aspect_weights)
+                ),
+                flush=True,
+            )
+
     # data: TarMetadataDataset (real data) or ParquetImageDataset (imagenet smoke)
     if cfg.data.dataset == "tar":
         from ..data.tar_dataset import TarMetadataDataset
@@ -638,6 +742,7 @@ def train(cfg: ExperimentConfig):
             manifest_path=cfg.data.root,  # manifest path stored in root
             image_size=cfg.data.image_size,
             caption_field=getattr(cfg.data, "caption_field", "caption_qwen3_7_flash"),
+            aspect_buckets=aspect_buckets,
         )
         ds.set_epoch(resumed_epoch)
     elif cfg.data.dataset == "fixed_tar":
@@ -650,6 +755,7 @@ def train(cfg: ExperimentConfig):
             cases_path=cfg.data.root,
             image_size=cfg.data.image_size,
             shuffle=True,
+            aspect_buckets=aspect_buckets,
         )
         ds.set_epoch(resumed_epoch)
     else:
@@ -657,14 +763,15 @@ def train(cfg: ExperimentConfig):
             root=cfg.data.root, split=cfg.data.split, parquet_glob=cfg.data.parquet_glob,
             image_size=cfg.data.image_size, image_field=cfg.data.image_field,
             label_field=getattr(cfg.data, "label_field", "label"),
+            aspect_buckets=aspect_buckets,
         )
         ds.set_epoch(resumed_epoch)
     text_buckets = tuple(int(x) for x in getattr(cfg.train, "text_length_buckets", ()))
     pad_text_to_max = bool(getattr(cfg.train, "pad_text_to_max_length", True))
-    if text_buckets:
+    if text_buckets or aspect_buckets:
         text_bucket_weights = tuple(
             int(x) for x in getattr(cfg.train, "text_length_bucket_weights", ())
-        )
+        ) if text_buckets else ()
         sample_loader = DataLoader(ds, batch_size=None, num_workers=cfg.data.num_workers)
         loader = LengthBucketBatcher(
             sample_loader,
@@ -672,11 +779,13 @@ def train(cfg: ExperimentConfig):
             cfg.train.batch_size_per_gpu,
             text_buckets,
             text_bucket_weights,
+            resolution_buckets=aspect_buckets,
+            resolution_weights=aspect_weights,
         )
         if rank == 0:
             print(
-                f"[train] static Qwen length buckets={text_buckets} "
-                f"weights={text_bucket_weights} "
+                f"[train] static Qwen length buckets={text_buckets or 'off'} "
+                f"weights={text_bucket_weights or 'off'} "
                 f"mmdit_text_buckets={not pad_text_to_max}",
                 flush=True,
             )
@@ -709,6 +818,7 @@ def train(cfg: ExperimentConfig):
     grad_norm_samples: list[float] = []
     measured_steps = 0
     bucket_counts = {}
+    resolution_bucket_counts = {}
     timestep_metrics = bool(getattr(cfg.train, "timestep_metrics", False))
     timestep_bin_counts = torch.zeros(10, device=dev, dtype=torch.float64)
     timestep_bin_fm_sums = torch.zeros_like(timestep_bin_counts)
@@ -766,7 +876,14 @@ def train(cfg: ExperimentConfig):
                 text = F.pad(text, (0, 0, 0, pad_length))
                 mask = F.pad(mask, (0, pad_length), value=0)
             n_img = (latents.shape[-1] // 2) * (latents.shape[-2] // 2)
-            expected_img = (cfg.data.image_size // 16) ** 2
+            image_height, image_width = batch["pixel_values"].shape[-2:]
+            token_stride = vae.scale_factor(max(image_height, image_width)) * cfg.model.patch_size
+            if image_height % token_stride or image_width % token_stride:
+                raise RuntimeError(
+                    f"input {image_width}x{image_height} is not divisible by "
+                    f"VAE+patch stride {token_stride}"
+                )
+            expected_img = (image_height // token_stride) * (image_width // token_stride)
             expected_text = cfg.model.qwen_vl.max_length if pad_text_to_max else bucket_length
             if text.shape[1] != expected_text:
                 raise RuntimeError(
@@ -776,8 +893,14 @@ def train(cfg: ExperimentConfig):
             if n_img != expected_img:
                 raise RuntimeError(
                     f"static compile expects {expected_img} image tokens from "
-                    f"{cfg.data.image_size}x{cfg.data.image_size}, got {n_img}"
+                    f"{image_width}x{image_height}, got {n_img}"
                 )
+            resolution_name = str(
+                batch.get("resolution_bucket", f"{image_width}x{image_height}")
+            )
+            resolution_bucket_counts[resolution_name] = (
+                resolution_bucket_counts.get(resolution_name, 0) + 1
+            )
             text_attn_mask = _attention_mask(
                 mmdit, mask, n_img, cfg.train.block_size, dev,
             )
@@ -893,6 +1016,7 @@ def train(cfg: ExperimentConfig):
             measured_steps = 0
             timer.reset()
             bucket_counts = {}
+            resolution_bucket_counts = {}
             if rank == 0:
                 print(f"[bench] warmup complete: {bench_warmup} steps; measurement starts now", flush=True)
         elif step + 1 > start_step + bench_warmup:
@@ -912,7 +1036,11 @@ def train(cfg: ExperimentConfig):
             mem_gib = torch.cuda.max_memory_reserved() / (1024 ** 3)
             mem_pct = 100.0 * torch.cuda.max_memory_reserved() / torch.cuda.get_device_properties(dev).total_memory
             timing_str = " ".join(f"{k}={v:.3f}s" for k, v in ts.items()) if ts else ""
-            bucket_str = f" buckets={dict(sorted(bucket_counts.items()))}" if text_buckets else ""
+            bucket_str = (
+                f" text_buckets={dict(sorted(bucket_counts.items()))}" if text_buckets else ""
+            )
+            if aspect_buckets:
+                bucket_str += f" resolution_buckets={dict(sorted(resolution_bucket_counts.items()))}"
             grad_norm_stats = None
             grad_norm_str = ""
             timestep_stats = None
@@ -948,11 +1076,13 @@ def train(cfg: ExperimentConfig):
                             "max_memory_reserved_gib": mem_gib, "max_memory_reserved_pct": mem_pct,
                             "timing": ts, "timing_unit": f"sum_over_{log_every}_steps",
                             "text_bucket_counts": dict(sorted(bucket_counts.items())),
+                            "resolution_bucket_counts": dict(sorted(resolution_bucket_counts.items())),
                             "grad_norm": grad_norm_stats,
                             "timestep_bins": timestep_stats}, _jf)
                 _jf.write("\n")
             timer.reset()
             bucket_counts = {}
+            resolution_bucket_counts = {}
             grad_norm_samples = []
         if timestep_metrics and step % log_every == 0:
             timestep_bin_counts.zero_()
