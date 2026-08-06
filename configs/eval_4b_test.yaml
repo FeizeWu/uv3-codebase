@@ -7,12 +7,16 @@ evaluation:
   async_when_gpu_available: true
   sample_steps: 30
   image_size: 256
+  # Fixed visual cases follow their source aspect using the same buckets as
+  # training. FID/KID remain square below so historical curves stay comparable.
+  fixed_aspect_buckets: [square, landscape, portrait, widescreen, phone]
   fixed_cases_manifest: /mnt/oss/uv3-pretrain-manifect/0803-test/eval-v1/fixed_cases_v2.jsonl
   holdout_manifest: /mnt/oss/uv3-pretrain-manifect/0803-test/eval-v1/holdout_manifest.jsonl
   fixed_cases:
     train: 16
     heldout: 16
   distribution_metrics:
+    image_size: 256
     num_generated: 10000
     metrics: [fid, kid, clipscore]
     # BS13 can OOM on an unusually long caption while FlexAttention builds its

@@ -16,10 +16,12 @@ import yaml
 from PIL import Image
 
 from ..config import load_config
+from ..data.bucket_sampler import AspectBucket, build_aspect_buckets, choose_aspect_bucket
 from ..data.tar_dataset import TarMetadataDataset
+from ..data.transforms import center_crop_resize
 from ..modeling.flow import euler_schedule, euler_step
 from ..train.fsdp2 import apply_fsdp2, make_mesh
-from ..train.fsdp2_trainer import _attention_mask, build
+from ..train.fsdp2_trainer import _align_text_to_joint_length, _attention_mask, build
 
 
 def tensor_to_uint8(images: torch.Tensor) -> torch.Tensor:
@@ -89,17 +91,16 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in file if line.strip()]
 
 
-def load_reference(case: dict[str, Any], image_size: int) -> Image.Image:
+def load_reference(
+    case: dict[str, Any], image_height: int, image_width: int,
+) -> Image.Image:
     with open(case["image_tar"], "rb") as file:
         file.seek(case["offset"])
         raw = file.read(case["size"])
     image = Image.open(io.BytesIO(raw)).convert("RGB")
-    # Fixed-case references are display artifacts; generation/FID real images use
-    # the training transform through TarMetadataDataset.
-    image.thumbnail((image_size, image_size), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGB", (image_size, image_size), "white")
-    canvas.paste(image, ((image_size - image.width) // 2, (image_size - image.height) // 2))
-    return canvas
+    # Match the training crop exactly so the reference and generated image have
+    # the same bucket shape; distribution metrics still use their own protocol.
+    return center_crop_resize(image, (image_height, image_width))
 
 
 def load_eval_config(path: Path) -> dict[str, Any]:
@@ -148,22 +149,55 @@ def load_checkpoint_weights(model, checkpoint: Path, use_ema: bool) -> int:
 
 
 @torch.inference_mode()
-def encode_prompts(qwen, model, prompts: list[str], image_tokens: int, cfg, device):
+def encode_prompts(
+    qwen,
+    model,
+    prompts: list[str],
+    image_tokens: int,
+    cfg,
+    device,
+    image_token_budget: int | None = None,
+):
     ids, valid = qwen.tokenize(prompts, device, max_length=cfg.model.qwen_vl.max_length)
     text = qwen.encode_text(ids, valid)
+    if image_token_budget is not None:
+        text, valid, _ = _align_text_to_joint_length(
+            text, valid, image_tokens, image_token_budget,
+        )
     mask = _attention_mask(model, valid, image_tokens, cfg.train.block_size, device)
     return text, mask
 
 
 @torch.inference_mode()
-def sample_batch(model, vae, text, attention_mask, seeds, steps: int, image_size: int):
+def sample_batch(
+    model,
+    vae,
+    text,
+    attention_mask,
+    seeds,
+    steps: int,
+    image_height: int,
+    image_width: int | None = None,
+):
     device, dtype = text.device, text.dtype
-    channels, spatial = vae.latent_spec(image_size)
+    image_width = image_height if image_width is None else int(image_width)
+    image_height = int(image_height)
+    scale = vae.scale_factor(max(image_height, image_width))
+    if image_height % scale or image_width % scale:
+        raise ValueError(
+            f"inference resolution {image_width}x{image_height} is not divisible "
+            f"by VAE scale {scale}"
+        )
+    latent_shape = (
+        vae.latent_channels,
+        image_height // scale,
+        image_width // scale,
+    )
     noises = []
     for seed in seeds:
         generator = torch.Generator(device=device).manual_seed(int(seed))
         noises.append(
-            torch.randn((channels, spatial, spatial), device=device, dtype=dtype, generator=generator)
+            torch.randn(latent_shape, device=device, dtype=dtype, generator=generator)
         )
     latents = torch.stack(noises)
     times = euler_schedule(steps, device, dtype)
@@ -179,39 +213,75 @@ def fixed_case_evaluation(model, vae, qwen, cfg, eval_cfg, output: Path, rank: i
     all_cases = read_jsonl(Path(eval_cfg["fixed_cases_manifest"]))
     if max_cases is not None:
         all_cases = all_cases[:max_cases]
-    # Equal work and tensor shapes on all FSDP ranks. Padding repeats are not saved.
-    per_rank = math.ceil(len(all_cases) / world)
-    padded = all_cases + [all_cases[-1]] * (per_rank * world - len(all_cases))
-    local = padded[rank::world]
-    prompts = [case["caption"] for case in local]
-    image_size = int(eval_cfg.get("image_size", cfg.data.image_size))
-    image_tokens = (image_size // 16) ** 2
-    text, attention_mask = encode_prompts(
-        qwen, model, prompts, image_tokens, cfg, torch.device("cuda", rank)
+    if not all_cases:
+        raise ValueError("fixed case manifest is empty")
+    image_size = int(eval_cfg.get("fixed_image_size", eval_cfg.get("image_size", cfg.data.image_size)))
+    configured_aspects = eval_cfg.get("fixed_aspect_buckets", ())
+    aspect_buckets = build_aspect_buckets(
+        image_size,
+        configured_aspects,
+        int(getattr(cfg.data, "resolution_stride", 16)),
     )
-    generated = sample_batch(
-        model, vae, text, attention_mask, [case["seed"] for case in local],
-        int(eval_cfg.get("sample_steps", 30)), image_size,
-    )
+    if not aspect_buckets:
+        aspect_buckets = (AspectBucket("square", image_size, image_size),)
+    image_token_budget = max(bucket.image_tokens for bucket in aspect_buckets)
+    sample_steps = int(eval_cfg.get("sample_steps", 30))
     samples_dir = output / "fixed"
     samples_dir.mkdir(parents=True, exist_ok=True)
     rows = []
-    for local_index, (case, image) in enumerate(zip(local, generated)):
-        global_index = rank + local_index * world
-        if global_index >= len(all_cases):
-            continue
-        generated_name = f'{global_index:04d}_{case["split"]}_generated.png'
-        reference_name = f'{global_index:04d}_{case["split"]}_reference.png'
-        save_tensor_image(image, samples_dir / generated_name)
-        load_reference(case, image_size).save(samples_dir / reference_name)
-        rows.append(
-            {
-                **case,
-                "generated": f"fixed/{generated_name}",
-                "reference": f"fixed/{reference_name}",
-                "sample_steps": int(eval_cfg.get("sample_steps", 30)),
-            }
+    grouped_cases = {bucket.name: [] for bucket in aspect_buckets}
+    for global_index, case in enumerate(all_cases):
+        bucket = choose_aspect_bucket(
+            int(case["width"]), int(case["height"]), aspect_buckets,
         )
+        grouped_cases[bucket.name].append((global_index, case))
+
+    # All ranks visit aspect groups in the same order and use a uniform shape
+    # within each group. Padding equalizes work; repeated rows are not saved.
+    for bucket in aspect_buckets:
+        group = grouped_cases[bucket.name]
+        if not group:
+            continue
+        per_rank = math.ceil(len(group) / world)
+        padded = group + [group[-1]] * (per_rank * world - len(group))
+        local = padded[rank::world]
+        text, attention_mask = encode_prompts(
+            qwen,
+            model,
+            [case["caption"] for _, case in local],
+            bucket.image_tokens,
+            cfg,
+            torch.device("cuda", rank),
+            image_token_budget=image_token_budget,
+        )
+        generated = sample_batch(
+            model,
+            vae,
+            text,
+            attention_mask,
+            [case["seed"] for _, case in local],
+            sample_steps,
+            bucket.height,
+            bucket.width,
+        )
+        for local_index, ((global_index, case), image) in enumerate(zip(local, generated)):
+            if rank + local_index * world >= len(group):
+                continue
+            generated_name = f'{global_index:04d}_{case["split"]}_generated.png'
+            reference_name = f'{global_index:04d}_{case["split"]}_reference.png'
+            save_tensor_image(image, samples_dir / generated_name)
+            load_reference(case, bucket.height, bucket.width).save(samples_dir / reference_name)
+            rows.append(
+                {
+                    **case,
+                    "generated": f"fixed/{generated_name}",
+                    "reference": f"fixed/{reference_name}",
+                    "sample_steps": sample_steps,
+                    "resolution_bucket": bucket.name,
+                    "output_width": bucket.width,
+                    "output_height": bucket.height,
+                }
+            )
     rank_manifest = output / f"manifest.rank{rank}.jsonl"
     with rank_manifest.open("w", encoding="utf-8") as file:
         for row in rows:
@@ -250,7 +320,10 @@ def distribution_evaluation(
         raise ValueError(f"num_generated={total} must be divisible by world_size={world}")
     local_target = total // world
     batch_size = int(metric_cfg.get("batch_size_per_gpu", 1))
-    image_size = int(eval_cfg.get("image_size", cfg.data.image_size))
+    # Keep the distribution protocol square by default so resumed FID/KID
+    # remains comparable to earlier checkpoints. It can be changed explicitly
+    # without affecting multi-aspect fixed visual samples.
+    image_size = int(metric_cfg.get("image_size", eval_cfg.get("image_size", cfg.data.image_size)))
     sample_steps = int(eval_cfg.get("sample_steps", 30))
     seed_base = 20260805
     protocol = {
@@ -291,7 +364,7 @@ def distribution_evaluation(
         seeds = [seed_base + rank * local_target + index for index in local_indices]
         fake = sample_batch(
             model, vae, text, attention_mask, seeds,
-            sample_steps, image_size,
+            sample_steps, image_size, image_size,
         )
         for index, prompt, real_image, fake_image in zip(
             local_indices, prompts, real.cpu(), fake.cpu()

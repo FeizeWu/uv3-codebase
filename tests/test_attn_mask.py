@@ -126,6 +126,29 @@ def test_joint_length_alignment_padding_is_numerically_inert():
     assert diff < 1e-5, f"masked alignment slots changed output: diff={diff}"
 
 
+def test_rank_local_rectangles_share_joint_length_and_preserve_output_shape():
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    m = _make_model(dev, dtype=torch.float32)
+    m.eval()
+    joint_lengths = []
+    for latent_height, latent_width in ((32, 32), (26, 40), (24, 42)):
+        noisy = torch.randn(1, 32, latent_height, latent_width, device=dev)
+        text = torch.randn(1, 8, 256, device=dev)
+        valid = torch.ones(1, 8, dtype=torch.long, device=dev)
+        image_tokens = (latent_height // 2) * (latent_width // 2)
+        text, valid, _ = _align_text_to_joint_length(
+            text, valid, image_tokens=image_tokens, image_token_budget=260,
+        )
+        mask = _attention_mask(m, valid, image_tokens, 128, dev)
+        with torch.no_grad():
+            output = m.predict_velocity(
+                noisy, text, torch.tensor([0.5], device=dev), text_attn_mask=mask,
+            )
+        assert output.shape == noisy.shape
+        joint_lengths.append(text.shape[1] + image_tokens)
+    assert joint_lengths == [268, 268, 268]
+
+
 if __name__ == "__main__":
     print("test_attn_mask: mask verification")
     test_all_ones_mask_equals_no_mask()

@@ -15,10 +15,13 @@ export MASTER_PORT="${MASTER_PORT:-29675}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-# Static defaults are identical on every node even when the platform only
-# injects WORLD_SIZE/RANK/MASTER_* variables.  Callers may still override both.
+# Resume the completed 10k run by default. MAX_STEPS is the final total step,
+# not the number of extra steps, so 20000 continues for another 10000 steps.
+# These defaults are identical on every node; callers may override MAX_STEPS.
 RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_4node_10k}"
-MAX_STEPS="${MAX_STEPS:-10000}"
+MAX_STEPS="${MAX_STEPS:-20000}"
+ALLOW_RESUME="${ALLOW_RESUME:-1}"
+RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:-10000}"
 
 if [[ "${NNODES}" != "4" ]]; then
   echo "[error] this launcher is fixed for 4 nodes; got NNODES=${NNODES}" >&2
@@ -34,6 +37,14 @@ if [[ -z "${MASTER_ADDR}" || "${MASTER_ADDR}" == "localhost" || "${MASTER_ADDR}"
 fi
 if [[ "${GPUS_PER_NODE}" != "8" ]]; then
   echo "[error] UV3 config uses node-local num_shard=8; got GPUS_PER_NODE=${GPUS_PER_NODE}" >&2
+  exit 1
+fi
+if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[error] MAX_STEPS must be a positive integer; got ${MAX_STEPS}" >&2
+  exit 1
+fi
+if [[ "${ALLOW_RESUME}" == "1" ]] && (( MAX_STEPS <= RESUME_EXPECTED_STEP )); then
+  echo "[error] MAX_STEPS=${MAX_STEPS} must be greater than resumed step ${RESUME_EXPECTED_STEP}" >&2
   exit 1
 fi
 
@@ -125,6 +136,16 @@ expected_vae = Path("/mnt/data/users/wfz/checkpoints/black-forest-labs/FLUX.2-de
 if Path(cfg.model.vae.pretrained) != expected_vae:
     errors.append(f"config vae.pretrained={cfg.model.vae.pretrained!r}")
 if cfg.data.caption_field != "caption_qwen3_7_flash": errors.append(f"caption_field={cfg.data.caption_field!r}")
+expected_aspects = ("square", "landscape", "portrait", "widescreen", "phone")
+if not cfg.data.bucket: errors.append("resolution bucketing is disabled")
+if tuple(cfg.data.aspect_buckets) != expected_aspects:
+    errors.append(f"aspect_buckets={cfg.data.aspect_buckets!r}")
+if not cfg.data.online_joint_bucketing:
+    errors.append("online_joint_bucketing is disabled")
+if tuple(cfg.train.text_length_buckets) != (512, 640, 768, 896, 1024):
+    errors.append(f"text_length_buckets={cfg.train.text_length_buckets!r}")
+if cfg.train.pad_text_to_max_length:
+    errors.append("pad_text_to_max_length must be false for joint buckets")
 if cfg.model.num_double_layers != 0 or cfg.model.num_single_layers != 30:
     errors.append(f"layers={cfg.model.num_double_layers}+{cfg.model.num_single_layers}")
 if not cfg.model.self_flow.enabled: errors.append("Self-Flow is disabled")
@@ -144,7 +165,7 @@ PY
 
 output_dir="$("${PYTHON_BIN}" -c 'from uv3.config import load_config; import os; c=load_config(os.environ["CONFIG_PATH"]); print(c.train.output_dir)')/${RUN_NAME}"
 checkpoint="${output_dir}/ckpt.pt"
-if [[ "${ALLOW_RESUME:-0}" == "1" ]]; then
+if [[ "${ALLOW_RESUME}" == "1" ]]; then
   if [[ ! -f "${checkpoint}" ]]; then
     echo "[error] ALLOW_RESUME=1 but checkpoint is missing: ${checkpoint}" >&2
     exit 1
@@ -173,7 +194,7 @@ code_fingerprint="$(sha256sum uv3/train/fsdp2_trainer.py uv3/train/fsdp2.py uv3/
 echo "[launch] node=${NODE_RANK}/${NNODES} master=${MASTER_ADDR}:${MASTER_PORT} gpus/node=${GPUS_PER_NODE}"
 echo "[launch] python=${PYTHON_BIN} config=${CONFIG} run=${RUN_NAME} max_steps=${MAX_STEPS}"
 echo "[launch] manifest=${MANIFEST} code_fingerprint=${code_fingerprint}"
-echo "[launch] output=${output_dir} resume=${ALLOW_RESUME:-0}"
+echo "[launch] output=${output_dir} resume=${ALLOW_RESUME} expected_step=${RESUME_EXPECTED_STEP}"
 
 if [[ "${UV3_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   echo "[preflight] complete; UV3_PREFLIGHT_ONLY=1, not launching"
