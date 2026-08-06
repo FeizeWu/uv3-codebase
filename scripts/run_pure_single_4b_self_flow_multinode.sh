@@ -18,7 +18,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 # Qwen3.5-4B changes the MMDiT context projection shape, so this launcher starts
 # a new run by default.  Resume must be requested explicitly with a compatible
 # checkpoint produced by this same configuration.
-RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_qwen4b_4node_v2}"
+RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_qwen4b_4node_dynamic_v1}"
 MAX_STEPS="${MAX_STEPS:-100000}"
 ALLOW_RESUME="${ALLOW_RESUME:-0}"
 RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:-0}"
