@@ -525,6 +525,8 @@ class OnlineJointBucketBatcher:
         self.emitted_samples = 0
         self.promoted_samples = 0
         self.peak_buffer_samples = 0
+        self.decode_error_samples = 0
+        self.decode_fallback_duplicate_samples = 0
 
     @property
     def buffered_samples(self):
@@ -591,6 +593,28 @@ class OnlineJointBucketBatcher:
             if native <= target
         )
 
+    def _take_eligible(self, resolution_name, target, count):
+        selected = []
+        for native in reversed(self.text_buckets):
+            if native > target:
+                continue
+            queue = self._queues[(resolution_name, native)]
+            take = min(count - len(selected), len(queue))
+            for _ in range(take):
+                selected.append(queue.popleft())
+            if len(selected) == count:
+                break
+        promoted = sum(
+            int(sample["native_text_bucket"]) < target for sample in selected
+        )
+        return selected, promoted
+
+    def _replacement_samples(self, source, resolution_name, target, count):
+        while self._eligible_count(resolution_name, target) < count:
+            if not self._tokenize_more(source):
+                return [], 0
+        return self._take_eligible(resolution_name, target, count)
+
     def _select_spec(self, source):
         target = self._schedule[self._schedule_cursor % len(self._schedule)]
         while True:
@@ -612,19 +636,9 @@ class OnlineJointBucketBatcher:
                 self._eligible_count(name, target),
             ),
         )
-        selected = []
-        promoted = 0
-        for native in reversed(self.text_buckets):
-            if native > target:
-                continue
-            queue = self._queues[(resolution_name, native)]
-            take = min(self.batch_size - len(selected), len(queue))
-            for _ in range(take):
-                selected.append(queue.popleft())
-            if native < target:
-                promoted += take
-            if len(selected) == self.batch_size:
-                break
+        selected, promoted = self._take_eligible(
+            resolution_name, target, self.batch_size,
+        )
         if len(selected) != self.batch_size:
             raise AssertionError("eligible count and selected batch disagree")
         self._schedule_cursor += 1
@@ -632,10 +646,79 @@ class OnlineJointBucketBatcher:
         self.promoted_samples += promoted
         return target, resolution_name, selected, promoted
 
-    def _materialize(self, spec, futures):
+    def _decode_spec(self, spec, futures, source, executor, decoder):
+        from ..data.tar_dataset import TarDecodeFailure
+
         wait_start = time.perf_counter()
-        pixels = [future.result() for future in futures]
+        target, resolution_name, samples, _ = spec
+        pixels = [None] * len(samples)
+        pending = list(zip(range(len(samples)), futures))
+        while pending:
+            failed = []
+            for index, future in pending:
+                result = future.result()
+                if isinstance(result, TarDecodeFailure):
+                    failed.append((index, result))
+                elif isinstance(result, torch.Tensor):
+                    pixels[index] = result
+                else:
+                    raise TypeError(
+                        f"descriptor decoder returned unsupported type {type(result)!r}"
+                    )
+            if not failed:
+                break
+
+            first_error_index = self.decode_error_samples + 1
+            self.decode_error_samples += len(failed)
+            for error_index, (index, failure) in enumerate(
+                failed, start=first_error_index,
+            ):
+                if error_index <= 20:
+                    sample = samples[index]
+                    print(
+                        "[data] skipping malformed image "
+                        f"tar={sample.get('image_tar', '<custom>')} "
+                        f"offset={sample.get('offset', '?')} "
+                        f"size={sample.get('size', '?')} reason={failure.reason}",
+                        flush=True,
+                    )
+                elif error_index == 21:
+                    print("[data] further malformed-image warnings suppressed", flush=True)
+
+            replacements, _ = self._replacement_samples(
+                source, resolution_name, target, len(failed),
+            )
+            if replacements:
+                pending = []
+                for (index, _), replacement in zip(failed, replacements):
+                    samples[index] = replacement
+                    pending.append((index, executor.submit(decoder, replacement)))
+                continue
+
+            # This is reachable only at finite-source exhaustion. Reuse a full
+            # valid image-text pair so every distributed rank still emits the
+            # same batch shape and iteration count; malformed data never enters
+            # training and image/caption alignment remains intact.
+            donors = [index for index, pixel in enumerate(pixels) if pixel is not None]
+            if not donors:
+                raise RuntimeError(
+                    "all samples in a terminal online-bucket batch failed image decode; "
+                    "no valid pair is available to preserve distributed batch alignment"
+                )
+            for failure_offset, (index, _) in enumerate(failed):
+                donor = donors[failure_offset % len(donors)]
+                samples[index] = copy.copy(samples[donor])
+                pixels[index] = pixels[donor]
+                self.decode_fallback_duplicate_samples += 1
+            pending = []
+
         decode_wait = time.perf_counter() - wait_start
+        promoted = sum(
+            int(sample["native_text_bucket"]) < target for sample in samples
+        )
+        return (target, resolution_name, samples, promoted), pixels, decode_wait
+
+    def _materialize(self, spec, pixels, decode_wait):
         target, resolution_name, samples, promoted = spec
         pixel_values = torch.stack(pixels)
         pin_memory = torch.cuda.is_available()
@@ -676,6 +759,10 @@ class OnlineJointBucketBatcher:
             "bucket_source_samples": self.source_samples,
             "bucket_emitted_samples": self.emitted_samples,
             "bucket_decode_wait_seconds": decode_wait,
+            "bucket_decode_error_samples_cumulative": self.decode_error_samples,
+            "bucket_decode_fallback_duplicates_cumulative": (
+                self.decode_fallback_duplicate_samples
+            ),
         }
 
     def __iter__(self):
@@ -697,7 +784,10 @@ class OnlineJointBucketBatcher:
                 if not pending:
                     return
                 spec, futures = pending.popleft()
-                yield self._materialize(spec, futures)
+                spec, pixels, decode_wait = self._decode_spec(
+                    spec, futures, source, executor, decoder,
+                )
+                yield self._materialize(spec, pixels, decode_wait)
 
 
 def _align_text_to_joint_length(text, mask, image_tokens, image_token_budget):
@@ -1117,7 +1207,8 @@ def train(cfg: ExperimentConfig):
                 f"[train] online joint bucketing ON: text={text_buckets} "
                 f"smooth_weights={text_bucket_weights} "
                 f"joint_lengths={tuple(bucket + loader.max_image_tokens for bucket in text_buckets)} "
-                "aspect=rank-local adaptive decode=after-selection drop=forbidden",
+                "aspect=rank-local adaptive decode=after-selection "
+                "buffer_drop=forbidden malformed=skip+backfill",
                 flush=True,
             )
     elif text_buckets or aspect_buckets:
@@ -1174,6 +1265,8 @@ def train(cfg: ExperimentConfig):
     online_buffer_peak = 0
     online_source_samples = 0
     online_emitted_samples = 0
+    online_decode_error_samples = 0
+    online_decode_fallback_duplicates = 0
     timestep_metrics = bool(getattr(cfg.train, "timestep_metrics", False))
     timestep_bin_counts = torch.zeros(10, device=dev, dtype=torch.float64)
     timestep_bin_fm_sums = torch.zeros_like(timestep_bin_counts)
@@ -1230,6 +1323,13 @@ def train(cfg: ExperimentConfig):
             online_emitted_samples = int(
                 batch.get("bucket_emitted_samples", online_emitted_samples)
             )
+            online_decode_error_samples = int(batch.get(
+                "bucket_decode_error_samples_cumulative", online_decode_error_samples,
+            ))
+            online_decode_fallback_duplicates = int(batch.get(
+                "bucket_decode_fallback_duplicates_cumulative",
+                online_decode_fallback_duplicates,
+            ))
         timer.start()
         profile_begin(step)
         with torch.no_grad():
@@ -1466,6 +1566,16 @@ def train(cfg: ExperimentConfig):
             if distributed:
                 torch.distributed.all_reduce(reduced)
             reduced_resolution_loss = reduced.cpu()
+        reduced_decode_counts = None
+        if online_joint_bucketing and step % log_every == 0:
+            reduced_decode_counts = torch.tensor(
+                [online_decode_error_samples, online_decode_fallback_duplicates],
+                device=dev,
+                dtype=torch.int64,
+            )
+            if distributed:
+                torch.distributed.all_reduce(reduced_decode_counts)
+            reduced_decode_counts = reduced_decode_counts.cpu()
         if rank == 0 and step % log_every == 0:
             spd = measured_steps / (time.time() - t0 + 1e-9) if measured_steps else 0.0
             ts = timer.summary()
@@ -1518,18 +1628,25 @@ def train(cfg: ExperimentConfig):
             online_bucket_stats = None
             online_bucket_str = ""
             if online_joint_bucketing:
+                global_decode_errors = int(reduced_decode_counts[0])
+                global_fallback_duplicates = int(reduced_decode_counts[1])
                 online_bucket_stats = {
                     "promoted_samples": online_promoted_samples,
                     "buffer_peak_samples": online_buffer_peak,
                     "source_samples_cumulative": online_source_samples,
                     "emitted_samples_cumulative": online_emitted_samples,
-                    "dropped_samples_cumulative": 0,
+                    "dropped_samples_cumulative": global_decode_errors,
+                    "decode_fallback_duplicates_cumulative": (
+                        global_fallback_duplicates
+                    ),
                     "decode_wait_seconds": online_decode_wait_seconds,
                 }
                 online_bucket_str = (
                     f" online_bucket(promote={online_promoted_samples}"
                     f",buffer={online_buffer_peak}"
-                    f",decode_wait={online_decode_wait_seconds:.3f}s,drop=0)"
+                    f",decode_wait={online_decode_wait_seconds:.3f}s"
+                    f",drop={global_decode_errors}"
+                    f",fallback_dup={global_fallback_duplicates})"
                 )
             print(f"[train] step {step:5d} loss={loss.item():.4f} {spd:.2f}it/s mem={mem_gib:.1f}GiB({mem_pct:.1f}%){bucket_str}{online_bucket_str}{grad_norm_str} [{timing_str}]", flush=True)
             # JSONL metrics: timing_unit 自文档,说明 timing 是窗口和而非每步

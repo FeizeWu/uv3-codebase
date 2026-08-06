@@ -9,6 +9,7 @@ from uv3.data.bucket_sampler import (
     choose_aspect_bucket,
     normalize_bucket_names,
 )
+from uv3.data.tar_dataset import TarDecodeFailure
 from uv3.data.transforms import center_crop_resize, pil_to_tensor
 from uv3.train.fsdp2_trainer import (
     LengthBucketBatcher,
@@ -117,7 +118,9 @@ class _BatchTokenizer:
     def __call__(self, texts, **_kwargs):
         if isinstance(texts, str):
             texts = [texts]
-        return {"input_ids": [list(range(int(text))) for text in texts]}
+        return {
+            "input_ids": [list(range(int(text.split(":", 1)[0]))) for text in texts]
+        }
 
 
 def _descriptor_samples(resolution, height, width):
@@ -170,6 +173,56 @@ def test_online_joint_schedule_allows_rank_local_aspect_and_caption_promotion():
     assert second_square["text_bucket_length"] == second_landscape["text_bucket_length"] == 8
     assert second_square["bucket_promoted_samples"] == 2
     assert second_landscape["bucket_promoted_samples"] == 2
+
+
+def test_online_joint_bucket_skips_bad_images_and_backfills_aligned_pairs():
+    samples = [
+        {
+            "text": text,
+            "resolution_bucket": "square",
+            "image_height": 32,
+            "image_width": 32,
+            "value": value,
+        }
+        for text, value in (
+            ("3:bad-one", -1),
+            ("3:bad-two", -1),
+            ("3:good-one", 1),
+            ("3:good-two", 2),
+            ("3:good-three", 3),
+            ("3:good-four", 4),
+        )
+    ]
+
+    def decode(sample):
+        if sample["value"] < 0:
+            return TarDecodeFailure("synthetic truncated image")
+        return torch.full(
+            (3, sample["image_height"], sample["image_width"]),
+            float(sample["value"]),
+        )
+
+    batcher = OnlineJointBucketBatcher(
+        samples,
+        _BatchTokenizer(),
+        batch_size=2,
+        text_buckets=(4,),
+        text_weights=(1,),
+        resolution_buckets=(AspectBucket("square", 32, 32),),
+        tokenize_batch_size=2,
+        max_buffer_samples=100,
+        decode_workers=2,
+        decode_prefetch_batches=1,
+        decode_fn=decode,
+    )
+    batch = next(iter(batcher))
+
+    assert batch["text"] == ["3:good-one", "3:good-two"]
+    assert batch["pixel_values"].shape == (2, 3, 32, 32)
+    assert batch["pixel_values"][:, 0, 0, 0].tolist() == [1.0, 2.0]
+    assert batch["input_ids"].shape == (2, 4)
+    assert batch["bucket_decode_error_samples_cumulative"] == 2
+    assert batch["bucket_decode_fallback_duplicates_cumulative"] == 0
 
 
 def test_joint_alignment_adds_only_invalid_slots():

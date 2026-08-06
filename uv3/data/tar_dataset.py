@@ -15,6 +15,7 @@ import json
 import random
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import pyarrow.parquet as pq
 import torch
@@ -28,6 +29,13 @@ from .transforms import pil_to_tensor
 MANIFEST_PATH = "/mnt/oss/uv3-pretrain-manifect/0803-test/manifect.jsonl"
 CAPTION_FIELD = "caption_qwen3_7_flash"
 META_COLS = ["shard_key", "filename", "offset", "size", "width", "height", "format", CAPTION_FIELD]
+
+
+@dataclass(frozen=True)
+class TarDecodeFailure:
+    """Expected malformed-image result; storage and programming errors still raise."""
+
+    reason: str
 
 
 def partition_shard_indices(
@@ -221,7 +229,7 @@ class TarDescriptorDecoder:
             self._local.tar_cache = cache
         return cache
 
-    def __call__(self, sample: dict) -> torch.Tensor:
+    def __call__(self, sample: dict) -> torch.Tensor | TarDecodeFailure:
         cache = self._cache()
         image_tar = sample["image_tar"]
         if image_tar not in cache:
@@ -233,9 +241,18 @@ class TarDescriptorDecoder:
             cache.move_to_end(image_tar)
         handle = cache[image_tar]
         handle.seek(int(sample["offset"]))
-        raw = handle.read(int(sample["size"]))
-        image = Image.open(io.BytesIO(raw)).convert("RGB")
-        return pil_to_tensor(
-            image,
-            (int(sample["image_height"]), int(sample["image_width"])),
-        )
+        expected_size = int(sample["size"])
+        raw = handle.read(expected_size)
+        if len(raw) != expected_size:
+            return TarDecodeFailure(
+                f"short tar read: expected {expected_size} bytes, got {len(raw)}"
+            )
+        try:
+            with Image.open(io.BytesIO(raw)) as image:
+                image = image.convert("RGB")
+                return pil_to_tensor(
+                    image,
+                    (int(sample["image_height"]), int(sample["image_width"])),
+                )
+        except (OSError, ValueError) as error:
+            return TarDecodeFailure(f"{type(error).__name__}: {error}")
