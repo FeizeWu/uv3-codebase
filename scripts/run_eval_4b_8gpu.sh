@@ -60,9 +60,28 @@ if [[ -n "${SAMPLE_STEPS:-}" ]]; then extra_args+=(--sample-steps "${SAMPLE_STEP
 echo "[eval] weights=student run=${RUN_NAME} checkpoint=${CHECKPOINT}"
 echo "[eval] fixed=train+heldout; distribution=heldout FID/KID/CLIPScore"
 
-exec "${PYTHON_BIN}" -m torch.distributed.run \
-  --standalone \
+# The caller may itself be a multi-node launcher. Remove inherited elastic and
+# rank variables, then use an explicit one-node static rendezvous. Otherwise a
+# completed 4-node job can make this new local torchrun wait for departed nodes.
+exec env \
+  -u RANK \
+  -u WORLD_SIZE \
+  -u LOCAL_RANK \
+  -u LOCAL_WORLD_SIZE \
+  -u GROUP_RANK \
+  -u ROLE_RANK \
+  -u ROLE_WORLD_SIZE \
+  -u MASTER_ADDR \
+  -u MASTER_PORT \
+  -u TORCHELASTIC_RUN_ID \
+  -u TORCHELASTIC_RESTART_COUNT \
+  -u TORCHELASTIC_MAX_RESTARTS \
+  -u TORCHELASTIC_ERROR_FILE \
+  "${PYTHON_BIN}" -m torch.distributed.run \
+  --nnodes=1 \
   --nproc_per_node="${GPUS_PER_NODE}" \
+  --node_rank=0 \
+  --master_addr=127.0.0.1 \
   --master_port="${MASTER_PORT}" \
   -m uv3.eval.checkpoint_evaluator \
   --train-config "${TRAIN_CONFIG}" \

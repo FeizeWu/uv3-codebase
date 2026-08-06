@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import io
 import json
 import math
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import yaml
@@ -238,6 +239,7 @@ def distribution_evaluation(
     rank: int,
     world: int,
     max_generated: int | None,
+    release_generation_models: Callable[[], None],
 ):
     from torchmetrics.image.fid import FrechetInceptionDistance
     from torchmetrics.image.kid import KernelInceptionDistance
@@ -336,10 +338,17 @@ def distribution_evaluation(
             flush=True,
         )
     torch.distributed.barrier()
+    release_generation_models()
+    del model, vae, qwen
+    gc.collect()
     torch.cuda.empty_cache()
+    torch.distributed.barrier()
+    if rank == 0:
+        print("[eval] released generation models; starting cached metrics", flush=True)
 
     # Metrics are rebuilt from durable uint8 artifacts. If metric computation is
     # interrupted, the expensive diffusion generation is still fully resumable.
+    metrics_batch_size = int(metric_cfg.get("metrics_batch_size_per_gpu", batch_size))
     fid = FrechetInceptionDistance(feature=2048, normalize=False).to(metric_device)
     kid = KernelInceptionDistance(subset_size=min(1000, total)).to(metric_device)
     clip_model = clip_processor = None
@@ -357,7 +366,7 @@ def distribution_evaluation(
     clip_count = torch.zeros((), device=metric_device, dtype=torch.float64)
     processed = 0
     while processed < local_target:
-        current = min(batch_size, local_target - processed)
+        current = min(metrics_batch_size, local_target - processed)
         samples = []
         for local_index in range(processed, processed + current):
             sample = load_cached_distribution_sample(
@@ -396,8 +405,10 @@ def distribution_evaluation(
             scores = 100.0 * (image_features * text_features).sum(dim=-1).clamp_min(0)
             clip_sum += scores.double().sum()
             clip_count += scores.numel()
+            del pil_images, clip_inputs, clip_output, image_features, text_features, scores
+        del samples, real, fake, prompts
         processed += current
-        if rank == 0 and processed % max(batch_size * 10, 1) == 0:
+        if rank == 0 and processed % max(metrics_batch_size * 10, 1) == 0:
             print(f"[eval] distribution metrics local={processed}/{local_target}", flush=True)
     fid_value = float(fid.compute().item())
     kid_mean, kid_std = kid.compute()
@@ -468,6 +479,12 @@ def main() -> None:
         eval_cfg.get("distribution_metrics", {}).get("enabled", True)
     )
     if not args.skip_distribution and distribution_enabled:
+        def release_generation_models() -> None:
+            nonlocal model, vae, qwen
+            model = None
+            vae = None
+            qwen = None
+
         results = distribution_evaluation(
             model,
             vae,
@@ -479,6 +496,7 @@ def main() -> None:
             rank,
             world,
             args.max_generated,
+            release_generation_models,
         )
     if rank == 0:
         metadata = {

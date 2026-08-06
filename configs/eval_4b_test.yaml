@@ -18,6 +18,9 @@ evaluation:
     # BS13 can OOM on an unusually long caption while FlexAttention builds its
     # block mask. BS12 retains most throughput with several GiB of headroom.
     batch_size_per_gpu: 12
+    # Metrics run after the generation models are released. Keep CLIP/Inception
+    # batches conservative because all 10k feature states are retained for KID.
+    metrics_batch_size_per_gpu: 4
     clip_model_path: /mnt/data/share/checkpoints/openai-mirror/clip-vit-base-patch32
   schedule_later:
     interval_steps: 2000
