@@ -61,16 +61,21 @@ train:
   compile_dynamic: false
   compile_mode: default
   text_length_buckets: [512, 640, 768, 896, 1024]
-  # Smooth feasible allocation for the measured cumulative caption-length
-  # distribution. Short captions may be promoted to a larger bucket.
-  text_length_bucket_weights: [23, 21, 20, 15, 21]
+  # Qwen3.5-4B tokenizer distribution measured on 50k production captions.
+  # Demand CDF [20,38,56,70]% stays below measured supply CDF
+  # [22.08,41.05,60.54,75.39]%; the 30% max-length share drains long-caption
+  # backlog without additional dropping beyond the configured 1024-token
+  # truncation. The previous [23,21,20,15,21] mix was infeasible and inevitably
+  # filled the descriptor buffer.
+  text_length_bucket_weights: [20, 18, 18, 14, 30]
   pad_text_to_max_length: false
   flex_attention: true
   block_size: 128
   batch_size_per_gpu: 12
   grad_accum: 1
-  # The launcher requires and injects an explicit MAX_STEPS on every node.
-  max_steps: 1000
+  # Production runs are at least 100K steps. The launcher injects the same
+  # explicit MAX_STEPS on every node; this value is also safe for direct runs.
+  max_steps: 100000
   grad_clip: 1.0
   ckpt_every: 1000
   output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
@@ -79,8 +84,8 @@ train:
   wandb: false
   log_every: 10
   seed: 42
-  # Keep the established 10k-run baseline: both Self-Flow timesteps are sampled
-  # independently from the same unshifted Logit-Normal distribution.
+  # Both Self-Flow timesteps are sampled independently from the same unshifted
+  # Logit-Normal distribution.
   timestep_strategy: logit_normal
   timestep_logit_mean: 0.0
   timestep_logit_std: 1.0

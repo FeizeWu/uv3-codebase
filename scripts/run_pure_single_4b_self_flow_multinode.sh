@@ -19,7 +19,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 # a new run by default.  Resume must be requested explicitly with a compatible
 # checkpoint produced by this same configuration.
 RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_qwen4b_4node_v2}"
-MAX_STEPS="${MAX_STEPS:-10000}"
+MAX_STEPS="${MAX_STEPS:-100000}"
 ALLOW_RESUME="${ALLOW_RESUME:-0}"
 RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:-0}"
 
@@ -41,6 +41,10 @@ if [[ "${GPUS_PER_NODE}" != "8" ]]; then
 fi
 if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[error] MAX_STEPS must be a positive integer; got ${MAX_STEPS}" >&2
+  exit 1
+fi
+if (( MAX_STEPS < 100000 )); then
+  echo "[error] production MAX_STEPS must be at least 100000; got ${MAX_STEPS}" >&2
   exit 1
 fi
 if [[ "${ALLOW_RESUME}" == "1" ]] && (( MAX_STEPS <= RESUME_EXPECTED_STEP )); then
@@ -145,6 +149,12 @@ if not cfg.data.online_joint_bucketing:
     errors.append("online_joint_bucketing is disabled")
 if tuple(cfg.train.text_length_buckets) != (512, 640, 768, 896, 1024):
     errors.append(f"text_length_buckets={cfg.train.text_length_buckets!r}")
+if tuple(cfg.train.text_length_bucket_weights) != (20, 18, 18, 14, 30):
+    errors.append(
+        f"unsafe text_length_bucket_weights={cfg.train.text_length_bucket_weights!r}"
+    )
+if cfg.data.bucket_buffer_max_samples < 8192:
+    errors.append(f"bucket_buffer_max_samples={cfg.data.bucket_buffer_max_samples!r}")
 if cfg.train.pad_text_to_max_length:
     errors.append("pad_text_to_max_length must be false for joint buckets")
 if cfg.model.num_double_layers != 0 or cfg.model.num_single_layers != 30:

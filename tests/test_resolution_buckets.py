@@ -1,6 +1,8 @@
 import itertools
+from pathlib import Path
 
 import torch
+import yaml
 from PIL import Image
 
 from uv3.data.bucket_sampler import (
@@ -110,6 +112,26 @@ def test_smooth_schedule_has_exact_weights_and_low_prefix_discrepancy():
         for bucket, weight in zip((4, 8, 12), (2, 3, 5)):
             expected = prefix_length * weight / 10
             assert abs(prefix.count(bucket) - expected) <= 1
+
+
+def test_production_text_schedule_is_feasible_for_measured_qwen35_distribution():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "train_pure_single_4b_self_flow_4node.yaml"
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    weights = config["train"]["text_length_bucket_weights"]
+    total = sum(weights)
+    demand_cdf = [sum(weights[:index]) / total for index in range(1, len(weights))]
+    # 50,000 production captions tokenized with the configured Qwen3.5-4B
+    # tokenizer on 2026-08-06. Keep at least two percentage points of margin.
+    measured_supply_cdf = [0.2208, 0.4105, 0.6054, 0.7539]
+
+    assert all(
+        supply - demand >= 0.02
+        for demand, supply in zip(demand_cdf, measured_supply_cdf)
+    )
 
 
 class _BatchTokenizer:
@@ -223,6 +245,52 @@ def test_online_joint_bucket_skips_bad_images_and_backfills_aligned_pairs():
     assert batch["input_ids"].shape == (2, 4)
     assert batch["bucket_decode_error_samples_cumulative"] == 2
     assert batch["bucket_decode_fallback_duplicates_cumulative"] == 0
+
+
+def test_bad_image_backfill_respects_full_descriptor_buffer():
+    samples = [
+        {
+            "text": text,
+            "resolution_bucket": "square",
+            "image_height": 32,
+            "image_width": 32,
+            "value": value,
+        }
+        for text, value in (
+            ("3:bad", -1),
+            ("3:good", 1),
+            ("8:queued-1", 2),
+            ("8:queued-2", 3),
+            ("8:queued-3", 4),
+            ("8:queued-4", 5),
+        )
+    ]
+
+    def decode(sample):
+        if sample["value"] < 0:
+            return TarDecodeFailure("synthetic truncated image")
+        return torch.full((3, 32, 32), float(sample["value"]))
+
+    batcher = OnlineJointBucketBatcher(
+        samples,
+        _BatchTokenizer(),
+        batch_size=2,
+        text_buckets=(4, 8),
+        text_weights=(1, 1),
+        resolution_buckets=(AspectBucket("square", 32, 32),),
+        tokenize_batch_size=6,
+        max_buffer_samples=4,
+        decode_workers=1,
+        decode_prefetch_batches=1,
+        decode_fn=decode,
+    )
+
+    batch = next(iter(batcher))
+
+    assert batch["text"] == ["3:good", "3:good"]
+    assert batch["bucket_buffer_samples"] == 4
+    assert batch["bucket_decode_error_samples_cumulative"] == 1
+    assert batch["bucket_decode_fallback_duplicates_cumulative"] == 1
 
 
 def test_joint_alignment_adds_only_invalid_slots():

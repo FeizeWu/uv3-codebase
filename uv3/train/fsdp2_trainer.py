@@ -527,6 +527,13 @@ class OnlineJointBucketBatcher:
         self.peak_buffer_samples = 0
         self.decode_error_samples = 0
         self.decode_fallback_duplicate_samples = 0
+        minimum_pigeonhole_buffer = len(self._queues) * (self.batch_size - 1) + 1
+        if self.max_buffer_samples < minimum_pigeonhole_buffer:
+            raise ValueError(
+                "online joint bucket buffer cannot guarantee that any exact-native "
+                f"queue becomes ready: limit={self.max_buffer_samples} "
+                f"minimum={minimum_pigeonhole_buffer}"
+            )
 
     @property
     def buffered_samples(self):
@@ -539,8 +546,23 @@ class OnlineJointBucketBatcher:
         )
 
     def _tokenize_more(self, source):
+        available = self.max_buffer_samples - self.buffered_samples
+        if available <= 0:
+            counts = {
+                f"{resolution}:{text}": len(queue)
+                for (resolution, text), queue in self._queues.items()
+                if queue
+            }
+            raise RuntimeError(
+                "online joint bucket descriptor buffer is full with no batch "
+                f"eligible for the scheduled target; limit={self.max_buffer_samples} "
+                f"queues={counts}. Check text bucket weights against the active tokenizer."
+            )
         samples = []
-        for _ in range(self.tokenize_batch_size):
+        # Never overshoot the hard limit merely because tokenization is batched.
+        # The configured schedule remains authoritative; a distribution drift
+        # still fails clearly rather than silently dropping descriptors.
+        for _ in range(min(self.tokenize_batch_size, available)):
             try:
                 samples.append(next(source))
             except StopIteration:
@@ -574,16 +596,7 @@ class OnlineJointBucketBatcher:
         buffered = self.buffered_samples
         self.peak_buffer_samples = max(self.peak_buffer_samples, buffered)
         if buffered > self.max_buffer_samples:
-            counts = {
-                f"{resolution}:{text}": len(queue)
-                for (resolution, text), queue in self._queues.items()
-                if queue
-            }
-            raise RuntimeError(
-                "online joint bucket descriptor buffer exceeded its hard limit; "
-                f"buffered={buffered} limit={self.max_buffer_samples} queues={counts}. "
-                "Refusing to silently drop training samples."
-            )
+            raise AssertionError(f"buffer limit violated: {buffered} > {self.max_buffer_samples}")
         return True
 
     def _eligible_count(self, resolution_name, target):
@@ -611,6 +624,11 @@ class OnlineJointBucketBatcher:
 
     def _replacement_samples(self, source, resolution_name, target, count):
         while self._eligible_count(resolution_name, target) < count:
+            # A malformed image must not turn unrelated queued descriptors into
+            # a buffer overflow. The decoder will duplicate a valid pair from
+            # the current batch when no bounded replacement can be admitted.
+            if self.buffered_samples >= self.max_buffer_samples:
+                return [], 0
             if not self._tokenize_more(source):
                 return [], 0
         return self._take_eligible(resolution_name, target, count)
