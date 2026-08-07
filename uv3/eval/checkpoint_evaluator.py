@@ -20,7 +20,7 @@ from ..data.bucket_sampler import AspectBucket, build_aspect_buckets, choose_asp
 from ..data.tar_dataset import TarMetadataDataset
 from ..data.transforms import center_crop_resize
 from ..modeling.flow import euler_schedule, euler_step
-from ..train.fsdp2 import apply_fsdp2, make_mesh
+from ..train.fsdp2 import apply_fsdp2, make_mesh, resolve_checkpoint_path
 from ..train.fsdp2_trainer import _align_text_to_joint_length, _attention_mask, build
 
 
@@ -122,7 +122,10 @@ def load_checkpoint_weights(model, checkpoint: Path, use_ema: bool) -> int:
         # parameters while loading; eight independent reads multiplied a 29GB
         # checkpoint into ~232GB of storage traffic.
         checkpoint_data = torch.load(
-            checkpoint, map_location="cpu", mmap=True, weights_only=False
+            resolve_checkpoint_path(checkpoint),
+            map_location="cpu",
+            mmap=True,
+            weights_only=False,
         )
         if use_ema:
             state = checkpoint_data.get("extra_models", {}).get("self_flow_teacher")

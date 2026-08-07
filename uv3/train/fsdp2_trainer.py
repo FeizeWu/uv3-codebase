@@ -2200,6 +2200,7 @@ def train(cfg: ExperimentConfig):
         noise = torch.randn_like(latents)
         target_v = velocity_target(latents, noise).float()
         sf_loss_per_sample = None
+        feat_loss = None
         if sf_enabled:
             paired_t = None
             if sf_timestep_mode == "independent":
@@ -2249,7 +2250,8 @@ def train(cfg: ExperimentConfig):
             noisy = interpolate(latents, noise, t)
             pred_v = mmdit(noisy, text, t, text_attn_mask=text_attn_mask)
             fm_loss_per_sample = (pred_v.float() - target_v).square().flatten(1).mean(1)
-            loss = fm_loss_per_sample.mean()
+            fm_loss = fm_loss_per_sample.mean()
+            loss = fm_loss
             profile_mark("student_forward_and_fm_loss")
         if resolution_index:
             resolution_idx = resolution_index[resolution_name]
@@ -2265,6 +2267,38 @@ def train(cfg: ExperimentConfig):
             timestep_bin_fm_sums += bin_fm
             timestep_bin_sf_sums += bin_sf
         timer.mark("forward")
+        if not bool(torch.isfinite(loss.detach()).item()):
+            resume_spec = batch.get("_resume_spec")
+            source_samples = []
+            if isinstance(resume_spec, (tuple, list)) and len(resume_spec) >= 3:
+                for sample in resume_spec[2]:
+                    source_samples.append(
+                        {
+                            "tar": os.path.basename(str(sample.get("image_tar", ""))),
+                            "offset": sample.get("offset"),
+                            "size": sample.get("size"),
+                        }
+                    )
+            finite_stages = {
+                "latents": bool(torch.isfinite(latents).all().item()),
+                "text": bool(torch.isfinite(text).all().item()),
+                "target": bool(torch.isfinite(target_v).all().item()),
+                "prediction": bool(torch.isfinite(pred_v).all().item()),
+            }
+            if sf_enabled:
+                finite_stages.update(
+                    {
+                        "student_features": bool(torch.isfinite(s_feat_img).all().item()),
+                        "teacher_features": bool(torch.isfinite(t_feat_img).all().item()),
+                        "projected_features": bool(torch.isfinite(proj_s).all().item()),
+                    }
+                )
+            raise FloatingPointError(
+                f"non-finite training loss before backward at step={step} rank={rank}: "
+                f"fm={float(fm_loss.detach().item())} "
+                f"self_flow={float(feat_loss.detach().item()) if feat_loss is not None else 'disabled'} "
+                f"finite={finite_stages} sources={source_samples}"
+            )
         (loss / accum).backward()                                     # backward
         profile_mark("backward")
         timer.mark("backward")
@@ -2280,7 +2314,8 @@ def train(cfg: ExperimentConfig):
                 # Clip mmdit (FSDP2 DTensor) and projector (regular) SEPARATELY
                 # because mixing DTensor and regular tensors breaks foreach.
                 mmdit_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    mmdit.parameters(), cfg.train.grad_clip
+                    mmdit.parameters(), cfg.train.grad_clip,
+                    error_if_nonfinite=True,
                 )
                 if audit_grad_norm:
                     # Execute on every rank: DTensor scalar materialization may
@@ -2289,7 +2324,10 @@ def train(cfg: ExperimentConfig):
                     if rank == 0:
                         grad_norm_samples.append(grad_norm_value)
                 if projector is not None:
-                    torch.nn.utils.clip_grad_norm_(projector.parameters(), cfg.train.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(
+                        projector.parameters(), cfg.train.grad_clip,
+                        error_if_nonfinite=True,
+                    )
             profile_mark("grad_clip")
             for o in optimizers.values():
                 o.step()                                             # optimizer
@@ -2477,6 +2515,7 @@ def train(cfg: ExperimentConfig):
                 opt_model, optimizers, ckpt_path, rng=g,
                 data_status=capture_data_status(completed_steps),
                 extra_models={"self_flow_teacher": teacher} if sf_enabled else None,
+                barrier_group=bucket_control_group,
             )
             if rank == 0:
                 print(f"[train] ckpt saved @ completed_step {completed_steps}", flush=True)
@@ -2490,6 +2529,7 @@ def train(cfg: ExperimentConfig):
             opt_model, optimizers, ckpt_path, rng=g,
             data_status=capture_data_status(step),
             extra_models={"self_flow_teacher": teacher} if sf_enabled else None,
+            barrier_group=bucket_control_group,
         )
     if rank == 0:
         lv = loss.item() if loss is not None else float("nan")

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import yaml
 
+from uv3.train.fsdp2 import _validated_checkpoint_step
+
 
 def ensure_gpus_idle() -> None:
     result = subprocess.run(
@@ -29,12 +31,7 @@ def ensure_gpus_idle() -> None:
 
 
 def checkpoint_step(checkpoint: Path) -> int:
-    code = (
-        "import torch; print(int(torch.load(" + repr(str(checkpoint))
-        + ",map_location='cpu',mmap=True,weights_only=False).get('step',0)))"
-    )
-    result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
-    return int(result.stdout.strip())
+    return _validated_checkpoint_step(checkpoint)
 
 
 def run_logged(command: list[str], env: dict[str, str], log_file) -> None:

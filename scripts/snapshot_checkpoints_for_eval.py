@@ -10,13 +10,18 @@ from pathlib import Path
 
 import torch
 
+from uv3.train.fsdp2 import resolve_checkpoint_path
+
 
 def checkpoint_step(path: Path) -> int:
-    payload = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+    payload = torch.load(
+        resolve_checkpoint_path(path), map_location="cpu", mmap=True, weights_only=False,
+    )
     return int(payload.get("step", -1))
 
 
 def snapshot(source: Path, destination: Path, expected_step: int) -> None:
+    source = resolve_checkpoint_path(source)
     if destination.exists():
         actual = checkpoint_step(destination)
         if actual != expected_step:

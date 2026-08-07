@@ -18,7 +18,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 # Qwen3.5-4B changes the MMDiT context projection shape, so this launcher starts
 # a new run by default.  Resume must be requested explicitly with a compatible
 # checkpoint produced by this same configuration.
-RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_qwen4b_4node_dynamic_v2}"
+RUN_NAME="${RUN_NAME:-train_pure_single_4b_self_flow_qwen4b_4node_dynamic_v3}"
 MAX_STEPS="${MAX_STEPS:-100000}"
 ALLOW_RESUME="${ALLOW_RESUME:-0}"
 RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:-0}"
@@ -75,6 +75,9 @@ export UV3_RUN_NAME="${RUN_NAME}"
 export UV3_MAX_STEPS="${MAX_STEPS}"
 export UV3_MONITOR="${UV3_MONITOR:-1}"
 export UV3_MONITOR_NAME="${UV3_MONITOR_NAME:-${RUN_NAME}}"
+# The scalarization costs far below one millisecond relative to multi-second
+# steps and makes gradient instability visible in both logs and monitoring.
+export UV3_AUDIT_GRAD_NORM="${UV3_AUDIT_GRAD_NORM:-1}"
 export CONFIG_PATH="${CONFIG}"
 
 MONITOR_ROOT="${UV3_MONITOR_ROOT:-/mnt/data/users/wfz/uv3-training-monitor}"

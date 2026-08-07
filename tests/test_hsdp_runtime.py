@@ -31,7 +31,9 @@ def main() -> None:
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.bfloat16,
         ),
-        reshard_after_forward=True,
+        # Match production: student parameters stay materialized between
+        # forward and backward, while the frozen teacher reshards immediately.
+        reshard_after_forward=False,
     )
     fully_shard(
         teacher,
@@ -48,8 +50,14 @@ def main() -> None:
     # both the shard and replicate dimensions and leaves one consistent model.
     generator = torch.Generator(device=device).manual_seed(1000 + global_rank)
     inputs = torch.randn(8, 32, device=device, generator=generator)
-    model(inputs).square().mean().backward()
-    optimizer.step()
+    for _ in range(8):
+        optimizer.zero_grad()
+        model(inputs).square().mean().backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), 1.0, error_if_nonfinite=True,
+        )
+        optimizer.step()
+        _ema_update_local_shards_(teacher, model, decay=0.9999)
     assert model.weight.dtype == torch.float32
     for state in optimizer.state.values():
         assert state["exp_avg"].dtype == torch.float32

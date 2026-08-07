@@ -6,6 +6,7 @@ supported but empirically correct on torch 2.12). ckpt via checkpoint.state_dict
 """
 from __future__ import annotations
 
+import json
 import os
 import random
 import shutil
@@ -191,16 +192,54 @@ def _step_checkpoint_path(target: Path, step: int) -> Path:
     return target.with_name(f"{target.stem}_step_{int(step):08d}{target.suffix}")
 
 
+_LATEST_POINTER_FORMAT = "uv3-checkpoint-pointer-v1"
+
+
+def resolve_checkpoint_path(path: str | Path) -> Path:
+    """Resolve a symlink or small UV3 latest-pointer manifest to its step file."""
+    current = Path(path)
+    for _ in range(4):
+        if current.is_symlink():
+            destination = current.readlink()
+            current = destination if destination.is_absolute() else current.parent / destination
+            continue
+        try:
+            stat = current.stat()
+        except FileNotFoundError:
+            return current
+        # A monolithic checkpoint is many MB/GB. Only inspect small files as
+        # possible pointer manifests so resolving never reads checkpoint data.
+        if stat.st_size > 16 * 1024:
+            return current
+        try:
+            value = json.loads(current.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, OSError):
+            return current
+        if not isinstance(value, dict) or value.get("format") != _LATEST_POINTER_FORMAT:
+            return current
+        filename = value.get("file")
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise RuntimeError(f"invalid checkpoint pointer target in {current}: {filename!r}")
+        destination = current.parent / filename
+        if not destination.is_file():
+            raise FileNotFoundError(
+                f"checkpoint pointer {current} targets missing file {destination}"
+            )
+        current = destination
+    raise RuntimeError(f"checkpoint pointer chain is too deep: {path}")
+
+
 def _validated_checkpoint_step(path: Path) -> int:
-    payload = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+    resolved = resolve_checkpoint_path(path)
+    payload = torch.load(resolved, map_location="cpu", mmap=True, weights_only=False)
     step = int(payload.get("step", -1))
     if step < 0:
-        raise RuntimeError(f"checkpoint has invalid step: {path}")
+        raise RuntimeError(f"checkpoint has invalid step: {resolved}")
     return step
 
 
 def _publish_latest_pointer(target: Path, retained: Path) -> None:
-    """Atomically point ckpt.pt at an immutable step file, with a copy fallback."""
+    """Atomically point ckpt.pt at an immutable step file without copying it."""
     temporary = target.with_name(f".{target.name}.latest")
     if os.path.lexists(temporary):
         temporary.unlink()
@@ -210,14 +249,34 @@ def _publish_latest_pointer(target: Path, retained: Path) -> None:
     except OSError:
         if os.path.lexists(temporary):
             temporary.unlink()
-        copy_stage = target.with_name(f".{target.name}.staged")
-        shutil.copyfile(retained, copy_stage)
-        if copy_stage.stat().st_size != retained.stat().st_size:
-            raise RuntimeError(f"latest checkpoint copy size mismatch: {copy_stage}")
-        os.replace(copy_stage, target)
+        # OSS/object-store mounts often reject symlinks. Publishing a tiny
+        # manifest keeps ckpt.pt atomic and avoids copying a 60+ GB checkpoint
+        # while every nonzero rank waits at the post-save barrier.
+        temporary.write_text(
+            json.dumps(
+                {
+                    "format": _LATEST_POINTER_FORMAT,
+                    "file": retained.name,
+                    "step": _validated_checkpoint_step(retained),
+                    "size": retained.stat().st_size,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, target)
 
 
-def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None, extra_models=None):
+def save_ckpt(
+    model,
+    optimizers: dict,
+    path: str,
+    rng=None,
+    data_status=None,
+    extra_models=None,
+    barrier_group=None,
+):
     """Save model + optimizer + RNG + data_status. Works in dist (rank0+barrier) and single modes."""
     from torch.distributed.checkpoint.state_dict import (
         get_model_state_dict, get_optimizer_state_dict, StateDictOptions,
@@ -269,7 +328,11 @@ def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None, ex
         # in progress. A SIGBUS/OSS write failure leaves either the old target
         # or a complete local recovery copy, not a truncated ckpt.pt.
         # Preserve a pre-upgrade ckpt.pt before replacing it with a latest pointer.
-        if target.exists() and not target.is_symlink():
+        if (
+            target.exists()
+            and not target.is_symlink()
+            and resolve_checkpoint_path(target) == target
+        ):
             previous_step = _validated_checkpoint_step(target)
             previous_retained = _step_checkpoint_path(target, previous_step)
             if not previous_retained.exists():
@@ -293,7 +356,10 @@ def save_ckpt(model, optimizers: dict, path: str, rng=None, data_status=None, ex
             _publish_latest_pointer(target, retained)
             local_stage.unlink()
     if dist_ok:
-        torch.distributed.barrier()
+        # Production passes a long-timeout Gloo control group. Checkpoint I/O
+        # can legitimately take minutes; it must not occupy an NCCL collective
+        # and trip the GPU watchdog while rank 0 writes to shared storage.
+        torch.distributed.barrier(group=barrier_group)
 
 
 def _unwrap_self_flow_model_state(model_state: dict) -> dict:
@@ -346,8 +412,9 @@ def load_ckpt(
     )
     dist_ok = torch.distributed.is_available() and torch.distributed.is_initialized()
     rank0 = (not dist_ok) or torch.distributed.get_rank() == 0
+    resolved_path = resolve_checkpoint_path(path)
     ckpt = (
-        torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+        torch.load(resolved_path, map_location="cpu", mmap=True, weights_only=False)
         if rank0 else {}
     )
     opts = StateDictOptions(

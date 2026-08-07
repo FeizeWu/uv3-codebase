@@ -5,7 +5,7 @@ import random
 import numpy as np
 import torch
 
-from uv3.train.fsdp2 import load_ckpt, save_ckpt
+from uv3.train.fsdp2 import load_ckpt, resolve_checkpoint_path, save_ckpt
 
 
 def _adam_step(model, optimizer):
@@ -52,6 +52,32 @@ def test_rng_checkpoint_contains_torch_python_and_numpy(tmp_path, monkeypatch):
     save_ckpt(model, {"adam": optimizer}, str(run_dir / "ckpt.pt"))
     state = torch.load(run_dir / "ckpt.pt", weights_only=False)["rng"]
     assert {"torch", "python", "numpy"}.issubset(state)
+
+
+def test_latest_pointer_manifest_does_not_copy_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("UV3_CKPT_STAGING_DIR", str(tmp_path / "staging"))
+    monkeypatch.setattr(
+        type(tmp_path),
+        "symlink_to",
+        lambda self, target: (_ for _ in ()).throw(OSError("unsupported")),
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    latest = run_dir / "ckpt.pt"
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    model._step = 7
+
+    save_ckpt(model, {"adam": optimizer}, str(latest))
+
+    retained = run_dir / "ckpt_step_00000007.pt"
+    assert retained.is_file()
+    assert latest.stat().st_size < 16 * 1024
+    assert resolve_checkpoint_path(latest) == retained
+    assert not (run_dir / ".ckpt.pt.staged").exists()
+    resumed = torch.nn.Linear(2, 2)
+    resumed_optimizer = torch.optim.AdamW(resumed.parameters())
+    assert load_ckpt(resumed, {"adam": resumed_optimizer}, str(latest)) == 7
 
 
 def test_self_flow_checkpoint_can_resume_into_student_only(tmp_path, monkeypatch):
