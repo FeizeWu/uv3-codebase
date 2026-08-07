@@ -109,13 +109,22 @@ def test_pure_single_self_flow_capture():
     teacher_cap.detach()
 
 
-def test_pure_single_freezes_unreachable_double_stream_modulations():
+def test_pure_single_never_executes_unreachable_double_stream_modulations():
     model = _make_model("cpu", double_layers=0, single_layers=2)
+    calls = []
     for module in (
         model.transformer.double_stream_modulation_img,
         model.transformer.double_stream_modulation_txt,
     ):
         assert all(not parameter.requires_grad for parameter in module.parameters())
+        module.register_forward_pre_hook(lambda *_args: calls.append(True))
+
+    noisy = torch.randn(1, 32, 16, 16)
+    text = torch.randn(1, 8, 256)
+    timestep = torch.tensor([0.5])
+    token_t = timestep[:, None].expand(1, (16 // 2) * (16 // 2))
+    model.predict_velocity(noisy, text, timestep, token_timesteps=token_t)
+    assert calls == []
 
 
 def test_depth_ratios_scale_to_model_depth():

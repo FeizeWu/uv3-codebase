@@ -48,7 +48,9 @@ train:
   fsdp2: true
   num_replicate: 1
   num_shard: 2
-  reshard_after_forward: true
+  # Match the production throughput path; this also exercises FP32 master
+  # restoration for trainable shards after backward.
+  reshard_after_forward: false
   mixed_precision: bf16
   compile: true
   compile_mode: default

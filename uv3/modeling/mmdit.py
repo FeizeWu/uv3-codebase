@@ -173,13 +173,20 @@ class MMDiT(nn.Module):
         # --- 3. Modulation ---
         # txt: per-sample (scalar t)
         temb_scalar = t.time_guidance_embed(sample_t.to(mdtype) * 1000, None)   # (B, D)
-        double_mod_txt = t.double_stream_modulation_txt(temb_scalar)            # (B, 6D)
-
         # img: per-token (token_timesteps)
         tt_flat = (token_timesteps.to(mdtype).reshape(-1) * 1000)              # (B*N,)
         temb_tt = t.time_guidance_embed(tt_flat, None)                         # (B*N, D)
         temb_tt = temb_tt.reshape(B, -1, temb_scalar.shape[-1])               # (B, N, D)
-        double_mod_img = t.double_stream_modulation_img(temb_tt)               # (B, N, 6D)
+
+        # A pure-single model has no consumer for the double-stream modulation
+        # tensors. Besides wasting work, calling these frozen FSDP units with
+        # no-reshard leaves their exposed parameter view in BF16 because no
+        # backward hook runs to restore the FP32 shard. Skip the unreachable
+        # modules entirely; mixed double+single models keep the original path.
+        double_mod_txt = double_mod_img = None
+        if t.transformer_blocks:
+            double_mod_txt = t.double_stream_modulation_txt(temb_scalar)        # (B, 6D)
+            double_mod_img = t.double_stream_modulation_img(temb_tt)            # (B, N, 6D)
 
         # single: txt scalar + img per-token, concatenated
         single_mod_scalar = t.single_stream_modulation(temb_scalar)            # (B, 3D)
