@@ -5,6 +5,7 @@ import random
 import numpy as np
 import torch
 
+import uv3.train.fsdp2 as fsdp2_module
 from uv3.train.fsdp2 import load_ckpt, resolve_checkpoint_path, save_ckpt
 
 
@@ -78,6 +79,28 @@ def test_latest_pointer_manifest_does_not_copy_checkpoint(tmp_path, monkeypatch)
     resumed = torch.nn.Linear(2, 2)
     resumed_optimizer = torch.optim.AdamW(resumed.parameters())
     assert load_ckpt(resumed, {"adam": resumed_optimizer}, str(latest)) == 7
+
+
+def test_same_filesystem_checkpoint_publish_uses_rename_not_copy(tmp_path, monkeypatch):
+    monkeypatch.setenv("UV3_CKPT_STAGING_DIR", str(tmp_path / "staging"))
+    monkeypatch.setattr(
+        fsdp2_module.shutil,
+        "copyfile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("same-filesystem checkpoint must not be copied")
+        ),
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    model._step = 3
+
+    save_ckpt(model, {"adam": optimizer}, str(run_dir / "ckpt.pt"))
+
+    retained = run_dir / "ckpt_step_00000003.pt"
+    assert retained.is_file()
+    assert int(torch.load(retained, weights_only=False)["step"]) == 3
 
 
 def test_self_flow_checkpoint_can_resume_into_student_only(tmp_path, monkeypatch):

@@ -216,6 +216,12 @@ if cfg.train.compile_vae and cfg.train.vae_compile_mode != "max-autotune-no-cuda
     errors.append(f"unsafe vae_compile_mode={cfg.train.vae_compile_mode!r}")
 if cfg.train.num_shard != 8: errors.append(f"num_shard={cfg.train.num_shard!r}")
 if not cfg.train.fsdp2: errors.append("FSDP2 is disabled")
+expected_output_root = Path("/mnt/data/users/wfz/uv3-codebase-runs")
+if Path(cfg.train.output_dir) != expected_output_root:
+    errors.append(
+        f"output_dir={cfg.train.output_dir!r}; production checkpoints must use "
+        f"CPFS {str(expected_output_root)!r}, never OSS"
+    )
 if errors:
     raise SystemExit("[error] config preflight failed: " + "; ".join(errors))
 print(
@@ -266,7 +272,7 @@ code_fingerprint="$(sha256sum uv3/config.py uv3/train/fsdp2_trainer.py uv3/train
 echo "[launch] node=${NODE_RANK}/${NNODES} master=${MASTER_ADDR}:${MASTER_PORT} gpus/node=${GPUS_PER_NODE}"
 echo "[launch] python=${PYTHON_BIN} config=${CONFIG} run=${RUN_NAME} max_steps=${MAX_STEPS}"
 echo "[launch] manifest=${MANIFEST} code_fingerprint=${code_fingerprint}"
-echo "[launch] output=${output_dir} resume=${ALLOW_RESUME} expected_step=${RESUME_EXPECTED_STEP}"
+echo "[launch] output=${output_dir} checkpoint=${checkpoint} resume=${ALLOW_RESUME} expected_step=${RESUME_EXPECTED_STEP}"
 
 if [[ "${UV3_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   echo "[preflight] complete; UV3_PREFLIGHT_ONLY=1, not launching"

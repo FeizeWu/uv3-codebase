@@ -85,7 +85,10 @@ train:
   max_steps: 100000
   grad_clip: 1.0
   ckpt_every: 1000
-  output_dir: /mnt/oss/users/wfz/uv3-codebase-runs
+  # CPFS is the live training filesystem. OSS remains archival storage only;
+  # writing a 60+ GiB monolithic checkpoint through ossfs stalls training and
+  # does not provide reliable POSIX link/rename semantics.
+  output_dir: /mnt/data/users/wfz/uv3-codebase-runs
   # The launcher requires and injects one identical RUN_NAME on every node.
   run_name: train_pure_single_4b_self_flow_4node
   wandb: false

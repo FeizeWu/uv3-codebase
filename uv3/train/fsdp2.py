@@ -324,9 +324,10 @@ def save_ckpt(
         staging_root.mkdir(parents=True, exist_ok=True)
         local_stage = staging_root / f"{retained.name}.staged"
         remote_stage = retained.with_name(f".{retained.name}.staged")
-        # Never overwrite the last good OSS checkpoint while serialization is
-        # in progress. A SIGBUS/OSS write failure leaves either the old target
-        # or a complete local recovery copy, not a truncated ckpt.pt.
+        # Never overwrite the last good checkpoint while serialization is in
+        # progress. On CPFS, staging and output share a filesystem, so publish
+        # the validated 60+ GiB file with atomic renames instead of copying it.
+        # OSS/archive targets retain the copy-and-validate fallback.
         # Preserve a pre-upgrade ckpt.pt before replacing it with a latest pointer.
         if (
             target.exists()
@@ -347,14 +348,22 @@ def save_ckpt(
             torch.save(payload, local_stage)
             if _validated_checkpoint_step(local_stage) != step:
                 raise RuntimeError(f"local checkpoint validation failed: {local_stage}")
-            shutil.copyfile(local_stage, remote_stage)
-            if remote_stage.stat().st_size != local_stage.stat().st_size:
-                raise RuntimeError(f"OSS checkpoint size mismatch: {remote_stage}")
+            local_size = local_stage.stat().st_size
+            same_filesystem = (
+                os.stat(staging_root).st_dev == os.stat(retained.parent).st_dev
+            )
+            if same_filesystem:
+                os.replace(local_stage, remote_stage)
+            else:
+                shutil.copyfile(local_stage, remote_stage)
+            if remote_stage.stat().st_size != local_size:
+                raise RuntimeError(f"checkpoint size mismatch: {remote_stage}")
             if _validated_checkpoint_step(remote_stage) != step:
-                raise RuntimeError(f"OSS checkpoint validation failed: {remote_stage}")
+                raise RuntimeError(f"checkpoint validation failed: {remote_stage}")
             os.replace(remote_stage, retained)
             _publish_latest_pointer(target, retained)
-            local_stage.unlink()
+            if local_stage.exists():
+                local_stage.unlink()
     if dist_ok:
         # Production passes a long-timeout Gloo control group. Checkpoint I/O
         # can legitimately take minutes; it must not occupy an NCCL collective
